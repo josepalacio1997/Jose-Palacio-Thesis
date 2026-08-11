@@ -1,0 +1,233 @@
+---
+title: "RSV Bayes Renewal — Agreement Plots (Variant A vs Variant B)"
+author: "Jose Palacio"
+format: html
+execute:
+  echo: true
+  eval: true
+  warning: false
+  message: false
+---
+
+# What this file does
+
+Reproduces the two-panel scatter figure comparing the posterior means of
+$R_t$ and $I_t$ between the two observation-noise specifications of the
+Ensor/Palacio single-plant renewal model:
+
+- **Variant A** (`sigma_mode = "1byplant"`): homoscedastic viral-load
+  observation noise with a single scalar $\hat\sigma_y$ per plant.
+- **Variant B** (`sigma_mode = "filter"`): heteroscedastic input using
+  the week-specific filter uncertainty $\hat P_t$ from the MARSS
+  Stage-1 filter.
+
+Each dot is one week of a given plant; the dashed line is the identity
+$y = x$. Points close to the line mean Variant A and Variant B agree
+on that week.
+
+Assumes you have already run the main renewal QMD (`Bayes_Renewal_Code_Ensor.qmd`)
+and saved the two fits as `.rds` files (see the "Save fits to disk" chunk
+of that file):
+
+```
+outputs/fitA_cpd_1byplant.rds
+outputs/fitB_cpd_filter.rds
+```
+
+If you have not saved them yet, just source the fitting chunks of the
+main QMD first, then run this file.
+
+```{r}
+#| label: packages
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(patchwork)
+})
+```
+
+# 1 · Paths
+
+```{r}
+#| label: paths
+proj_root <- if (Sys.info()["sysname"] == "Darwin") {
+  "~/Documents/Claude/Projects/NOTS/rsv_mcmc_stan_geoW"
+} else {
+  normalizePath(".", mustWork = FALSE)
+}
+proj_root <- normalizePath(proj_root, mustWork = TRUE)
+
+FIT_A_PATH <- file.path(proj_root, "outputs", "fitA_cpd_1byplant.rds")
+FIT_B_PATH <- file.path(proj_root, "outputs", "fitB_cpd_filter.rds")
+
+stopifnot(file.exists(FIT_A_PATH), file.exists(FIT_B_PATH))
+OUT_DIR <- file.path(proj_root, "outputs", "figures")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 2 · Load the two fits
+
+```{r}
+#| label: load-fits
+fitA <- readRDS(FIT_A_PATH)   # Variant A: sigma_y homoscedastic per plant
+fitB <- readRDS(FIT_B_PATH)   # Variant B: filter (P_t) as input
+
+# Sanity: same P and T?
+stopifnot(dim(fitA$y_PT) == dim(fitB$y_PT))
+P  <- nrow(fitA$y_PT)
+Tt <- ncol(fitA$y_PT)
+cat(sprintf("Loaded fits: P = %d plants, T = %d weeks\n", P, Tt))
+```
+
+# 3 · Extract posterior means of R_t and I_t per (plant, week)
+
+Each fit exposes `extract_array(name)` from the `renewal_model()` return
+object (see main QMD, section 10). The array has dims `[draws, P, T]`;
+we collapse over draws to get posterior means.
+
+```{r}
+#| label: extract-posterior-means
+
+posterior_mean_PT <- function(fit, param) {
+  arr <- fit$extract_array(param)      # [draws, P, T]
+  if (is.null(arr))
+    stop("Parameter '", param, "' not found in fit.")
+  apply(arr, c(2, 3), mean, na.rm = TRUE)
+}
+
+Rt_A <- posterior_mean_PT(fitA, "Rt")   # P x T
+Rt_B <- posterior_mean_PT(fitB, "Rt")
+
+It_A <- posterior_mean_PT(fitA, "It")
+It_B <- posterior_mean_PT(fitB, "It")
+
+# Sanity
+stopifnot(dim(Rt_A) == c(P, Tt), dim(Rt_B) == c(P, Tt))
+cat(sprintf("Rt_A range: [%.3f, %.3f]\n", min(Rt_A), max(Rt_A)))
+cat(sprintf("Rt_B range: [%.3f, %.3f]\n", min(Rt_B), max(Rt_B)))
+cat(sprintf("It_A range: [%.1f, %.1f]\n", min(It_A), max(It_A)))
+cat(sprintf("It_B range: [%.1f, %.1f]\n", min(It_B), max(It_B)))
+```
+
+# 4 · Build long-form data frames for ggplot
+
+```{r}
+#| label: long-form-data
+# Plant labels: if you have specific plant codes/names, replace here.
+# For the single-plant Ensor 69th Street case, P = 1 and plant_label = "69".
+plant_labels <- if (P == 1) "69" else paste0("Plant", seq_len(P))
+
+# Reshape wide P x T matrices into long tibbles with columns
+# (plant, week, valA, valB) — one row per (plant, week).
+mats_to_long <- function(mat_A, mat_B, value_name = "value") {
+  tibble(
+    plant = rep(plant_labels, times = Tt),
+    week  = rep(seq_len(Tt), each = P),
+    A     = as.vector(mat_A),
+    B     = as.vector(mat_B)
+  ) |>
+    rename(!!paste0(value_name, "_A") := A,
+           !!paste0(value_name, "_B") := B)
+}
+
+df_Rt <- mats_to_long(Rt_A, Rt_B, "R")
+df_It <- mats_to_long(It_A, It_B, "I")
+```
+
+# 5 · The two scatter plots
+
+```{r}
+#| label: scatter-plots
+#| fig-width: 12
+#| fig-height: 5.5
+
+# Common theme matching the paper style
+plot_theme <- theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "plain"),
+    strip.background = element_rect(fill = "grey95", color = "grey60"),
+    strip.text      = element_text(size = 10),
+    axis.title      = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+# Panel A: R_t agreement (linear axes)
+p_Rt <- ggplot(df_Rt, aes(x = R_B, y = R_A)) +
+  facet_wrap(~ plant, scales = "free", nrow = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  geom_point(alpha = 0.55, color = "grey30", size = 1.3) +
+  labs(title = expression(R[t]),
+       x = expression("Filter Estimates, "*hat(P)[t]),
+       y = expression("Viral Load Measurements, "*sigma[y])) +
+  plot_theme
+
+# Panel B: I_t agreement (log-scale, since I spans orders of magnitude)
+p_It <- ggplot(df_It, aes(x = I_B, y = I_A)) +
+  facet_wrap(~ plant, scales = "free", nrow = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  geom_point(alpha = 0.55, color = "grey30", size = 1.3) +
+  scale_x_log10() + scale_y_log10() +
+  labs(title = expression(I[t]),
+       x = expression("Filter Estimates, "*hat(P)[t]),
+       y = expression("Viral Load Measurements, "*sigma[y])) +
+  plot_theme
+
+# Combine with letter labels A/B (matches paper style)
+fig <- (p_Rt | p_It) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "plain", size = 12))
+
+fig
+```
+
+# 6 · Save to PDF
+
+```{r}
+#| label: save-pdf
+out_pdf <- file.path(OUT_DIR, "CPL_vs_CPD_agreement.pdf")
+ggsave(out_pdf, fig, width = 12, height = 5.5)
+cat(sprintf("Saved: %s\n", out_pdf))
+```
+
+# 7 · Numerical agreement diagnostics (optional)
+
+Beyond the visual, quantify agreement with correlations and mean
+absolute error. Points close to the identity line correspond to high
+correlations and low MAE.
+
+```{r}
+#| label: agreement-numerics
+agreement_summary <- function(df, valA, valB, param_name) {
+  df |>
+    group_by(plant) |>
+    summarise(
+      n        = sum(is.finite(.data[[valA]]) & is.finite(.data[[valB]])),
+      pearson  = cor(.data[[valA]], .data[[valB]], use = "pairwise.complete.obs"),
+      MAE      = mean(abs(.data[[valA]] - .data[[valB]]), na.rm = TRUE),
+      MAE_rel  = MAE / mean(.data[[valB]], na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(quantity = param_name, .before = 1)
+}
+
+agreement <- bind_rows(
+  agreement_summary(df_Rt, "R_A", "R_B", "R_t"),
+  agreement_summary(df_It, "I_A", "I_B", "I_t")
+)
+
+print(agreement)
+```
+
+# Notes
+
+- **Panel A vs Panel B**: If Variant A and Variant B agree on point
+  estimates, all points lie on the dashed identity line. Off-diagonal
+  scatter reflects Variant-A's homoscedastic scalar-noise assumption
+  compensating with slightly different latent trajectories vs the
+  time-varying-noise Variant B.
+- **Log-scale in Panel B ($I_t$)**: $I_t$ spans several orders of
+  magnitude within a season (~10 at baseline to >100 at peak); the
+  log-scale makes the dispersion at small values visible without hiding
+  the peak values.
+- **Reproducibility**: if you re-run the fits with different MCMC seeds,
+  point estimates shift by Monte Carlo error (~1-2%), but the visual
+  agreement structure is stable.

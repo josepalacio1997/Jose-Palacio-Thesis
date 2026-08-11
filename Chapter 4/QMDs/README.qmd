@@ -1,0 +1,272 @@
+---
+title: "README"
+format: html
+---
+
+# Buffer-capture analysis
+
+How well does a circular buffer around one polygon approximate another, nesting one --- in terms of captured population? One function, one result list.
+
+## Layout
+
+```         
+proj/
+├── R/
+│   ├── core.R                  functions for computing distances
+│   ├── plot.R                  plot helpers + default colors / labels
+│   ├── analysis.R              orchestrator + save helpers
+│   ├── generate_test_data.R    states + counties test for example (fake population data)
+│   └── source_all.R            sources the four files above
+├── outputs/                    serialised result + bisection log
+├── figures/                    PNG plots
+├── analysis.qmd                narrative report
+└── review_plan.md              what to check, why, and how
+```
+
+## Syntax 
+
+You need two `sf` polygons --- the smaller one nesting inside the larger --- and a tract layer with a population column. The function takes them directly; nothing has to be renamed.
+
+The following functions are defined in `R/core.r`. See below for example usage.
+
+``` r
+result <- buffer_capture_analysis(
+  inner           = my_inner_batch,    # sf, single row, smaller
+  outer           = my_outer_batch,    # sf, single row, contains inner
+  tracts          = my_tracts,         # sf with a population column
+  pop_col         = "Pop",
+  people_per_dot  = 10,
+  target_fraction = 0.95,
+  tolerance       = list(frac = 0.005, radius_m = 25),
+  proj_crs        = 32615,             # any projected CRS in meters
+  colors          = list(              # any subset; defaults fill in
+    inner_fill   = "#f5d4cf",
+    outer_stroke = "#1f6fa8",
+    dot_inside   = "#7a4a00"
+  ),
+  labels          = list(inner = "69th Street", outer = "Sims Bayou")
+)
+
+# Inspect anything:
+result$centroid_guess$proportion
+result$target$radius
+result$mesh$recommended$k_safe
+result$plots$target_radius
+
+# Optionally save to disk:
+save_buffer_analysis(result, fig_dir = "figures", out_dir = "outputs")
+
+# Render the report:
+quarto::quarto_render("analysis.qmd")
+```
+
+## Arguments
+
+| Argument | Default | What it does |
+|------------------------|------------------------|------------------------|
+| `inner` | -- | Single-row sf polygon. Buffer is centered on its centroid. |
+| `outer` | -- | Single-row sf polygon. Population is sampled inside it. Assumed to contain `inner`. |
+| `tracts` | -- | sf polygon layer with a population column. Anything outside `outer` is filtered out. |
+| `pop_col` | `"Pop"` | Name of the population column in `tracts`. |
+| `people_per_dot` | `10` | Approx. people per grid point. Smaller -\> denser mesh, slower, more accurate. |
+| `target_fraction` | `0.95` | Captured fraction the optimised buffer must hit. |
+| `tolerance` | `list(frac=0.005, radius_m=25)` | Bisection stopping criteria. Pass partial; defaults fill in. |
+| `proj_crs` | `NULL` | EPSG code or CRS object. If non-NULL, all inputs are reprojected before any geometry math. Use a projected CRS in meters. |
+| `rule` | `"centroid_in"` | Tract-in-batch rule. `"intersects"` for an inclusive variant. |
+| `colors` | `NULL` | Partial override of `default_colors()`. See `R/plot.R` for the full key set. |
+| `labels` | `NULL` | Partial override of `default_labels()` (`inner`, `outer`). Used in plot titles. |
+| `seed` | `20250507` | Reproducibility seed. |
+
+## What you get back
+
+A list with these slots:
+
+```         
+$inputs           the resolved inputs (in projected CRS)
+$dots             sf points; one row per population dot
+$centroid_guess   $center, $cent_outer, $radius, $proportion,
+                  $buffer, $intersection, $captured
+$target           $target_fraction, $radius, $proportion,
+                  $iterations, $iter_log,
+                  $buffer, $intersection, $captured, $center
+$mesh             $geometry, $current, $tolerances, $recommended,
+                  $meets_target
+$plots            $overview, $dots, $centroid_guess, $target_radius
+                  (all ggplot objects)
+```
+
+## Try it with fake population data and state boundaries
+
+`generate_test_data()` builds a state-and-county fixture with synthetic populations:
+
+```{r}
+source("R/source_all.R")
+
+td <- generate_test_data("LA", "TX")        # any two state codes
+
+# Real US states don't truly nest, so for a clean demo of the nesting
+# assumption, wrap `inner` in a buffer to manufacture an `outer`:
+#fake_outer <- make_nesting_outer(td$inner, buffer_km = 200)
+
+result <- buffer_capture_analysis(
+  inner    = td$inner,
+  outer    = td$outer,
+  tracts   = td$tracts,
+  proj_crs = 5070,                          # CONUS Albers
+  labels   = list(inner = "Louisiana", outer = "LA + 200km buffer"),
+  people_per_dot = 500000
+)
+
+result$plots
+```
+
+Or, to exercise the geometry on overlapping (not strictly nesting) shapes, pass the two states straight through. The math still runs; you just lose the "buffer is bounded by outer's perimeter" intuition.
+
+## Picking proj_crs
+
+Buffer distances need a CRS in meters. Common choices:
+
+-   `5070` (NAD83 / Conus Albers Equal Area) -- safe default for any pair of contiguous-US polygons.
+-   `32615` (UTM 15N) -- Houston, eastern Texas, Louisiana.
+-   `32610`-`32619` -- other UTM zones for North America.
+-   Whatever your data ships with, if it's already projected.
+
+A geographic CRS (lat/lon) is rejected with a warning; the function will not produce sensible distances.
+
+## Try with WWTP batch data
+
+```{r}
+## you can download the pop density data from rebecca's email-- put that folder in the same one as this file.
+## note: you will have to update the paths in your version of Read in shape files.R
+source("23. Population Density WWTP/Read in shape files.R") 
+
+## add code to intersect overlapped tracts and split for true nesting
+
+result <- buffer_capture_analysis(
+  inner    = dplyr::filter(batches_valid, BatchName == "BATCH SIMS BAYOU"),
+  outer    = dplyr::filter(batches_valid, BatchName == "69TH STREET"),
+  tracts   = tracts_valid,
+  proj_crs = 5070,# CONUS Albers
+  pop_col  = "POP24_5YR",
+  labels   = list(inner = "Batch Sims Bayou", outer = "69th St"),
+  people_per_dot = 200, 
+  target_fraction = .5 ## median
+)
+
+result$plots
+```
+
+## Compute distance matrix
+
+`region_distance_matrix()` refuses geographic CRS, so project once up front and reuse for both calls below.
+
+### Centroid
+
+Centroid-to-centroid distance between every pair of batches:
+
+```{r}
+batches_proj <- sf::st_transform(batches_valid, 5070)
+tracts_proj  <- sf::st_transform(tracts_valid,  5070)
+
+d_centroid <- region_distance_matrix(
+  regions   = batches_proj,
+  label_col = "BatchName",
+  method    = "centroid",
+  units     = "km"
+)
+plot_distance_heatmap(d_centroid, cluster = TRUE)
+```
+
+### Population %
+
+Population-based: entry `[i, j]` is the radius around batch i's centroid that captures half (`target_fraction = 0.5`) of batch j's population, using the same tract layer, column, and `people_per_dot` as the buffer analysis above.
+
+```{r}
+d_pop_50 <- region_distance_matrix(
+  regions         = batches_proj,
+  label_col       = "BatchName",
+  method          = "population",
+  tracts          = tracts_proj,
+  pop_col         = "POP24_5YR",
+  target_fraction = 0.5,
+  people_per_dot  = 200,
+  units           = "km"
+)
+plot_distance_heatmap(d_pop_50, cluster = TRUE)
+
+d_pop_25 <- region_distance_matrix(
+  regions         = batches_proj,
+  label_col       = "BatchName",
+  method          = "population",
+  tracts          = tracts_proj,
+  pop_col         = "POP24_5YR",
+  target_fraction = 0.25,
+  people_per_dot  = 200,
+  units           = "km"
+)
+plot_distance_heatmap(d_pop_25, cluster = TRUE)
+
+d_pop_75 <- region_distance_matrix(
+  regions         = batches_proj,
+  label_col       = "BatchName",
+  method          = "population",
+  tracts          = tracts_proj,
+  pop_col         = "POP24_5YR",
+  target_fraction = 0.75,
+  people_per_dot  = 200,
+  units           = "km"
+)
+plot_distance_heatmap(d_pop_75, cluster = TRUE)
+```
+
+### Hausdorff
+
+```{r}
+d_haus <- region_distance_matrix(
+  regions         = batches_proj,
+  label_col       = "BatchName",
+  method          = "hausdorff",
+  units           = "km"
+)
+plot_distance_heatmap(d_haus, cluster = TRUE)
+```
+
+### Extended Hausdorff
+
+```{r}
+#| eval: false
+## not yet implemented. need method = exthausdorff to be implemented in region_distance_matrix
+d_haus_50 <- region_distance_matrix(
+  regions         = batches_proj,
+  label_col       = "BatchName",
+  method          = "exthausdorff", ## todo: implement
+  #tracts          = tracts_proj, ## don't need for ext haus actually
+  units           = "km",
+  perc_area       = 0.5 ## todo: implement 
+)
+plot_distance_heatmap(d_haus_50, cluster = TRUE)
+```
+
+## Correlation between distances
+
+```{r}
+dists_wide <- data.frame(
+  dists_centroid = as.numeric(d_centroid[upper.tri(d_centroid)]),
+  d_pop_25       = d_pop_25[upper.tri(d_pop_25)],
+  d_pop_50       = d_pop_50[upper.tri(d_pop_50)],
+  d_pop_75       = d_pop_75[upper.tri(d_pop_75)],
+  d_haus = as.numeric(d_haus[upper.tri(d_haus)])
+)
+
+panel_with_abline <- function(data, mapping, ...) {
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "22")
+}
+
+GGally::ggpairs(
+  dists_wide,
+  lower = list(continuous = panel_with_abline)
+)
+```

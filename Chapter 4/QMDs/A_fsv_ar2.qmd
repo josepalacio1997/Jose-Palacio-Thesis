@@ -1,0 +1,785 @@
+---
+title: "Spatial RSV Renewal — Stan (FSV AR(2), rho = 0 baseline)"
+subtitle: "Single-fit: rho FIXED at 0 (independent epidemics), raw input (no MARSS Stage 1), AR(2) on lambda with fixed (phi1, phi2) = (2, -1), per-plant sigma_obs"
+author: "Jose Palacio"
+date: today
+date-format: "MMMM D, YYYY"
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    progress: true
+    code-line-numbers: true
+    highlight-style: github
+    footer: "Spatial RSV Renewal · Stan · 15 plants · FSV AR(2) · rho = 0"
+    transition: fade
+    background-transition: fade
+    incremental: false
+    toc: false
+    smaller: true
+    scrollable: true
+    fig-align: center
+    fig-width: 9
+    fig-height: 5
+execute:
+  echo: true
+  eval: true
+  warning: false
+  message: false
+  cache: false
+knitr:
+  opts_chunk:
+    comment: "#>"
+editor_options:
+  chunk_output_type: console
+editor:
+  markdown:
+    wrap: 72
+---
+
+```{=html}
+<style>
+:root { --font-scale: 0.75; --code-scale: 0.75; }
+.reveal .slides         { font-size: calc(40px * var(--font-scale)); }
+.reveal .slides h1      { font-size: calc(2.2em * var(--font-scale)); }
+.reveal .slides h2      { font-size: calc(1.6em * var(--font-scale)); }
+.reveal pre, .reveal pre code { font-size: calc(0.75em * var(--code-scale)); }
+.reveal table           { font-size: calc(0.8em * var(--font-scale)); }
+</style>
+```
+
+```{r}
+#| label: root-dir
+#| include: false
+# proj_root: ruta absoluta a la carpeta donde viven data/, stan/, R/.
+# Local Mac: usa absoluta para que funcione desde cualquier cwd.
+# NOTS: cambiar a `normalizePath(".")` (cwd del SLURM submit dir).
+proj_root <- if (Sys.info()["sysname"] == "Darwin") {
+  "/Users/josepalacio/Documents/Claude/Projects/NOTS/rsv_mcmc_stan_geoW"
+} else {
+  normalizePath(".", mustWork = FALSE)
+}
+knitr::opts_knit$set(root.dir = proj_root)
+cat("proj_root =", proj_root, "\n")
+```
+
+# 0 · What this file does {background-color="#2c3e50"}
+
+## Variant: ρ fixed at 0, **AR(2) on growth rate**, FSV (raw input)
+
+This is the **AR(2) rho = 0 baseline** of the FSV model. The 15 plants
+are modelled as independent epidemics (no spatial coupling). Key features:
+
+1.  **AR(2) on the mean of $\lambda$** with fixed coefficients
+    $(\varphi_1, \varphi_2) = (2, -1)$. This matches MARSS structurally:
+    MARSS uses $l_t = 2 l_{t-1} - l_{t-2} + w_t$ on the level $l_t$,
+    and applying the same shape to the spatial growth rate $\lambda$
+    yields direct comparability without adding parameters.
+2.  **Two anchors needed**: $\lambda_{p,1}, \lambda_{p,2} \sim
+    \mathcal{N}(0, 0.5^2)$ instead of one. Recursion starts at $t = 3$.
+3.  **ρ is FIXED at 0** — no spatial coupling between plants. Each plant
+    evolves on its own. The W matrix is built but only multiplied by zero.
+4.  **No MARSS Stage 1** — raw `y` with NA mask.
+5.  **`log_beta ~ Normal(0, 4)`**, `sigma_obs_pl ~ Half-Normal(0, 2)`
+    componentwise.
+6.  **Stan file**: `stan/renewal_A_fsv_ar2.stan` (rho-as-data variant).
+
+**The knob that defines this baseline:**
+
+``` r
+Batch_focus <- paste0("WWTP", 1:15)
+FIXED_RHO   <- 0.0   # rho FIXED as data (independent epidemics baseline)
+```
+
+**Purpose.** Provide the φ = 0 baseline for the AR(2) coupling experiment.
+Comparison against `A_fsv_est_ar2.qmd` (φ estimated) isolates the
+effect of spatial mixing on Rt and It under the AR(2) latent process.
+
+# 1 · Packages, paths, helpers {background-color="#2c3e50"}
+
+## Packages
+
+```{r}
+#| label: packages
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(sf)
+  # NOTE: MARSS NOT loaded — this variant skips Stage 1.
+  library(cmdstanr)      # Stan interface
+  library(posterior)     # draws_df, ess, rhat
+  library(purrr)
+})
+set.seed(123)
+```
+
+## Settings — the only knobs
+
+```{r}
+#| label: settings
+# ---- The knob that defines this baseline -----------------------------------
+Batch_focus <- paste0("WWTP", 1:15)
+
+# FSV AR(2) rho=0 baseline: rho FIXED at 0 (independent epidemics).
+FIXED_RHO <- 0.0
+
+# rho_grid is kept as a single placeholder so downstream code that references
+# rho_grid[1] keeps working — but rho itself is fixed as data.
+rho_grid  <- c(FIXED_RHO)
+
+# W is built from the population-based distance matrix d_pop_50 only
+# (centroid path removed for clarity).
+
+# ---- Input data paths (relative to proj_root for NOTS bundle) --------------
+raw_csv_path <- file.path(proj_root, "data",
+                          "all_ts_observed_ILI_20250526_pool.csv")
+shp_batch    <- file.path(proj_root, "data", "WWTP_Batch",
+                          "WWTP_061621_mergedWWTPs to Batch_updatedon07192024.shp")
+shp_ct_pop   <- file.path(proj_root, "data", "Census_Tracts",
+                          "WWTP Batch Service Areas_ Census Tracts.csv")
+csv_ct_pop   <- file.path(proj_root, "data", "Census_Tracts",
+                          "WWTP Batch Service Areas_ Census Tracts_Population.csv")
+
+# ---- Tracts shapefile used by the buffer-capture analysis ------------------
+tracts_shp_path <- file.path(proj_root, "data", "Census_Tracts_Population",
+  "WWTP Batch Service Areas_Census Tracts_Population.shp")
+
+# ---- Pipeline constants ----------------------------------------------------
+casos_houston_semana <- 324
+burnin               <- 15
+cutoff_date_min      <- as.Date("2023-01-02")
+
+prior_mean_gen_days  <- 7.5    # Vink 2014 RSV
+prior_sd_gen_days    <- 2.1
+mean_shed_days       <- 4.6    # Cevik 2023
+sd_shed_days         <- 2.0
+
+# ---- MCMC defaults (Exp B: same as Exp A for direct comparison) -----------
+n_chains      <- 3
+iter_warmup   <- 2000
+iter_sampling <- 8000     # Exp B: 8000 samples → 24000 total post-warmup
+adapt_delta   <- 0.95
+max_treedepth <- 15
+```
+
+## Helpers
+
+```{r}
+#| label: helpers
+# to_gamma: Gamma shape/scale for a (mean, sd) given in DAYS, returned in WEEKS.
+to_gamma <- function(mean_days, sd_days) {
+  m <- mean_days / 7; s <- sd_days / 7
+  list(shape = (m^2) / (s^2), scale = (s^2) / m)
+}
+
+# make_shedding_kernel: discretised Gamma shedding kernel including lag 0.
+make_shedding_kernel <- function(mean_shed_days, sd_shed_days, K = 2) {
+  par_d   <- to_gamma(mean_shed_days, sd_shed_days)
+  edges_d <- c(-0.5, seq(0.5, K + 0.5, by = 1))
+  F_d     <- pgamma(pmax(edges_d, 0),
+                    shape = par_d$shape, scale = par_d$scale)
+  w_d     <- diff(F_d)
+  w_d     <- pmax(w_d, 0) / sum(pmax(w_d, 0))
+  list(d = w_d, G = K, D = length(w_d))
+}
+```
+
+# 2 · Shapefile + crosswalk {background-color="#2c3e50"}
+
+## Read the WWTP shapefile and build the WWTP1..WWTP15 crosswalk
+
+```{r}
+#| label: shapefile-crosswalk
+stopifnot(file.exists(shp_batch))
+
+wwtp_shp_batch <- sf::read_sf(shp_batch) |>
+  sf::st_transform(32615) |>
+  mutate(BatchName = toupper(trimws(BatchName)))
+
+batch_key_shp <- wwtp_shp_batch |>
+  sf::st_drop_geometry() |>
+  distinct(BatchName) |>
+  arrange(BatchName) |>
+  mutate(Batch = paste0("WWTP", row_number()))
+
+wwtp_shp_batch <- wwtp_shp_batch |>
+  left_join(batch_key_shp, by = "BatchName")
+
+wwtp_shp_focus <- wwtp_shp_batch |>
+  filter(Batch %in% Batch_focus) |>
+  arrange(match(Batch, Batch_focus))
+
+stopifnot(nrow(wwtp_shp_focus) == length(Batch_focus))
+n_plants <- length(Batch_focus)
+
+cat("Crosswalk WWTPn -> BatchName:\n")
+print(batch_key_shp |> filter(Batch %in% Batch_focus))
+```
+
+## Census-tract population allocation
+
+```{r}
+#| label: ct-allocation
+ct_raw <- read_csv(csv_ct_pop, show_col_types = FALSE) |>
+  mutate(BatchName = toupper(trimws(BatchName)))
+
+ct_alloc <- ct_raw |>
+  left_join(batch_key_shp, by = "BatchName") |>
+  filter(!is.na(Batch)) |>
+  mutate(
+    pop_alloc = Percent_ce * POP24_5YR,
+    moe_alloc = Percent_ce * MOE24_5YR
+  )
+
+# Geometry for census tracts (prefer real shapefile; fall back to synthetic).
+if (file.exists(shp_ct_pop) &&
+    grepl("\\.shp$", shp_ct_pop, ignore.case = TRUE)) {
+  ct_sf <- sf::read_sf(shp_ct_pop) |>
+    sf::st_transform(32615) |>
+    mutate(BatchName = toupper(trimws(BatchName))) |>
+    left_join(
+      ct_alloc |> select(BatchName, Percent_ce, POP24_5YR, pop_alloc, Batch),
+      by = c("BatchName", "Percent_ce", "POP24_5YR")
+    ) |>
+    filter(!is.na(Batch))
+} else {
+  message("Census tract shapefile not found — generating synthetic centroids.")
+  ct_alloc_sf <- ct_alloc |>
+    left_join(wwtp_shp_batch |> select(BatchName, geometry), by = "BatchName") |>
+    sf::st_as_sf()
+  set.seed(999)
+  pts <- lapply(seq_len(nrow(ct_alloc_sf)), function(i) {
+    s <- tryCatch(sf::st_sample(ct_alloc_sf[i, ], size = 1, type = "random"),
+                  error = function(e) NULL)
+    if (is.null(s) || length(s) == 0)
+      s <- sf::st_point_on_surface(sf::st_geometry(ct_alloc_sf[i, ]))
+    s
+  })
+  ct_sf <- ct_alloc |>
+    mutate(geometry = do.call(c, pts)) |>
+    sf::st_as_sf(crs = 32615)
+}
+
+ct_pop_by_batch <- ct_alloc |>
+  group_by(Batch) |>
+  summarise(N_acs = sum(pop_alloc, na.rm = TRUE),
+            N_moe_acs = sqrt(sum(moe_alloc^2, na.rm = TRUE)),
+            .groups = "drop")
+
+cat("\nPopulation per batch:\n"); print(ct_pop_by_batch)
+```
+
+# 3 · Wastewater data {background-color="#2c3e50"}
+
+## Read CSV + apply the batch-code crosswalk
+
+```{r}
+#| label: wastewater-load
+batch_crosswalk <- tibble(
+  batch_code = c("B69", "BAS", "BIA", "BKW", "BNO", "BNE", "BNW",
+                 "BSB", "BSO", "BSE", "BWE", "BWS", "BKB", "BSW", "BWB"),
+  BatchName  = c("69TH STREET", "ALMEDA SIMS", "BATCH INTERCONTINENTAL",
+                 "BATCH KINGWOOD", "BATCH NORTH", "BATCH NORTHEAST",
+                 "BATCH NORTHWEST", "BATCH SIMS BAYOU", "BATCH SOUTH",
+                 "BATCH SOUTHEAST", "BATCH WEST", "BATCH WEST SOUTH",
+                 "KEEGANS BAYOU", "SOUTHWEST", "WILLOWBROOK")
+)
+
+ww_input <- read_csv(raw_csv_path, show_col_types = FALSE) |>
+  mutate(WWTP  = toupper(trimws(WWTP)),
+         tn    = toupper(trimws(tn)),
+         BATCH = toupper(trimws(BATCH))) |>
+  filter(WWTP != "SS", tn == "RSV") |>
+  transmute(batch_code = BATCH, WWTP = WWTP, n_plants = Bnum,
+            Date = as.Date(date), Pathogen = tn,
+            copies_L = copies_L, Flow = flow_interp) |>
+  arrange(batch_code, Date)
+
+ww_input <- ww_input |>
+  group_by(batch_code) |>
+  mutate(median_flow = median(Flow, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(copies_day = (copies_L * median_flow) / 1e9) |>
+  left_join(batch_crosswalk, by = "batch_code") |>
+  left_join(batch_key_shp,   by = "BatchName")
+
+batches_in_data <- ww_input |> filter(!is.na(Batch)) |>
+  distinct(Batch) |> pull(Batch)
+missing_focus <- setdiff(Batch_focus, batches_in_data)
+if (length(missing_focus) > 0)
+  stop("These Batch_focus plants have no wastewater data: ",
+       paste(missing_focus, collapse = ", "))
+
+ww <- ww_input |>
+  filter(Batch %in% Batch_focus) |>
+  arrange(Batch, Date)
+
+cat("Plants present in CSV:", length(batches_in_data),
+    " — focus uses:", length(Batch_focus), "\n")
+```
+
+# 4 · `N_plantas` and `It_init_vec` {background-color="#2c3e50"}
+
+```{r}
+#| label: pop-and-It-init
+N_plantas <- ct_pop_by_batch |>
+  filter(Batch %in% Batch_focus) |>
+  arrange(match(Batch, Batch_focus)) |>
+  { \(d) setNames(d$N_acs, d$Batch) }()
+
+N_houston <- sum(ct_pop_by_batch$N_acs, na.rm = TRUE)
+
+# Allocate the weekly Houston-wide case count to each plant proportionally
+# to its served population, then floor at 10 (Poisson→Lognormal stability).
+It_init_vec <- pmax(
+  round(casos_houston_semana * N_plantas[Batch_focus] / N_houston),
+  10
+)
+stopifnot(all(It_init_vec >= 10))
+
+cat("N_plantas (1k):\n"); print(round(N_plantas / 1e3, 1))
+cat("\nIt_init_vec:\n"); print(It_init_vec)
+```
+
+# 5 · `y_batch` — viral load matrix {background-color="#2c3e50"}
+
+```{r}
+#| label: y-batch
+ww_batch <- ww |>
+  select(Batch, n_plants, Date, Pathogen, copies_day, flow_batch = Flow)
+
+cutoff_date <- ww_batch |>
+  summarise(d = dplyr::nth(sort(unique(Date)), burnin,
+                           default = max(Date))) |>
+  pull(d) |>
+  max(cutoff_date_min)
+
+ww_rsv_batch <- ww_batch |>
+  filter(Date > cutoff_date) |>
+  mutate(copies_day = ifelse(is.na(copies_day) | copies_day <= 0,
+                              NA_real_, copies_day),
+         Missing    = is.na(copies_day)) |>
+  arrange(Batch, Date)
+
+make_wide_matrix <- function(df, value_col, plants_order) {
+  df |>
+    mutate(.val = {{ value_col }}) |>
+    select(Date, WWTP = Batch, .val) |>
+    dplyr::group_by(Date, WWTP) |>
+    dplyr::summarise(.val = if (all(is.na(.val))) NA_real_ else mean(.val, na.rm = TRUE),
+                     .groups = "drop") |>
+    pivot_wider(names_from = WWTP, values_from = .val, values_fill = NA_real_) |>
+    arrange(Date) |>
+    { \(w) {
+      missing_cols <- setdiff(plants_order, names(w))
+      for (m in missing_cols) w[[m]] <- NA_real_
+      w |> select(all_of(c("Date", plants_order)))
+    } }()
+}
+
+y_wide_batch <- make_wide_matrix(ww_rsv_batch, copies_day, Batch_focus)
+y_batch      <- as.matrix(y_wide_batch[, -1, drop = FALSE])
+rownames(y_batch) <- as.character(y_wide_batch$Date)
+
+stopifnot(identical(colnames(y_batch), Batch_focus))
+
+cat("y_batch:", nrow(y_batch), "weeks x", ncol(y_batch), "plants\n")
+cat("Missing cells:", sum(is.na(y_batch)), "/",
+    prod(dim(y_batch)), "\n")
+```
+
+# 6 · Generation + shedding kernels {background-color="#2c3e50"}
+
+```{r}
+#| label: kernels
+K_shed <- 2     # shedding kernel support (in weeks beyond lag 0)
+ks    <- make_shedding_kernel(mean_shed_days, sd_shed_days, K = K_shed)
+d_vec <- as.numeric(ks$d)         # shedding (lag 0..K_shed)
+G     <- ks$G                      # generation support length
+D     <- ks$D
+
+par_g <- to_gamma(prior_mean_gen_days, prior_sd_gen_days)
+edges <- seq(1.5, G + 0.5, by = 1)
+g_raw <- pgamma(edges, shape = par_g$shape, scale = par_g$scale) -
+         pgamma(edges - 1, shape = par_g$shape, scale = par_g$scale)
+g_raw <- pmax(g_raw, 0)
+g_vec <- g_raw / sum(g_raw)        # generation kernel (sums to 1)
+
+cat("g_vec (gen kernel, length", G, "):\n");  print(round(g_vec, 4))
+cat("d_vec (shed kernel, length", D, "):\n"); print(round(d_vec, 4))
+```
+
+# 7 · Buffer-capture analysis on the 15 plants {background-color="#2c3e50"}
+
+## Source helpers + read tracts
+
+```{r}
+#| label: source-buffer-capture
+source(file.path(proj_root, "R", "core.R"))
+source(file.path(proj_root, "R", "plot.R"))
+source(file.path(proj_root, "R", "analysis.R"))
+
+tracts_raw <- sf::st_read(tracts_shp_path, quiet = TRUE) |>
+  sf::st_make_valid() |>
+  dplyr::filter(sf::st_is_valid(geometry), !sf::st_is_empty(geometry))
+
+tracts_valid <- tracts_raw |>
+  dplyr::distinct(GEOID, .keep_all = TRUE) |>
+  sf::st_transform(32615)
+
+cat("tracts_valid:", nrow(tracts_valid), "unique tracts after dedupe.\n")
+```
+
+## Distance matrix: `d_pop_50`
+
+```{r}
+#| label: distance-matrices
+d_pop_50 <- region_distance_matrix(
+  regions         = wwtp_shp_focus,
+  label_col       = "BatchName",
+  method          = "population",
+  tracts          = tracts_valid,
+  pop_col         = "POP24_5YR",
+  target_fraction = 0.5,
+  people_per_dot  = 200,
+  units           = "km"
+)
+
+cat("d_pop_50: ", paste(dim(d_pop_50), collapse = " x "), "\n", sep = "")
+```
+
+## Heatmap of the distance matrix
+
+```{r}
+#| label: distance-heatmaps
+#| fig-width: 8
+#| fig-height: 7
+#| fig-show: "hide"
+#| results: "hide"
+dir.create("outputs/plots", showWarnings = FALSE, recursive = TRUE)
+pdf("outputs/plots/distance_heatmap_pop50.pdf", width = 8, height = 7)
+plot_distance_heatmap(d_pop_50, cluster = TRUE)
+invisible(dev.off())
+cat("→ outputs/plots/distance_heatmap_pop50.pdf\n")
+```
+
+# 8 · Distance → spatial weight matrix W {background-color="#2c3e50"}
+
+```{r}
+#| label: d-to-W
+make_W_from_distance <- function(d, sigma = NULL) {
+  stopifnot(nrow(d) == ncol(d))
+  d_dim   <- dim(d)
+  d_names <- dimnames(d)
+  d <- structure(as.numeric(unclass(d)),
+                 dim = d_dim, dimnames = d_names)
+
+  off <- d
+  diag(off) <- NA
+  if (is.null(sigma)) {
+    # Median heuristic on SQUARED distances (Gretton et al. 2012).
+    sigma <- sqrt(median(off^2, na.rm = TRUE) / 2)
+  }
+
+  K <- exp(-d^2 / (2 * sigma^2))
+  diag(K) <- 0
+  rs <- rowSums(K)
+  if (any(rs == 0))
+    stop("Row sum of K is zero — pick a larger sigma.")
+  W <- K / rs
+  attr(W, "sigma_km") <- sigma
+  attr(W, "kernel")   <- "gaussian"
+  W
+}
+
+W_pop50 <- make_W_from_distance(d_pop_50)
+
+cat(sprintf("kernel: %s, sigma (km): %.2f\n",
+            attr(W_pop50, "kernel"),
+            attr(W_pop50, "sigma_km")))
+
+stopifnot(all(abs(rowSums(W_pop50) - 1) < 1e-10),
+          all(diag(W_pop50) == 0))
+```
+
+## Rename BatchName → WWTPn and align with `Batch_focus`
+
+```{r}
+#| label: rename-W-WWTP
+bn_to_wwtp <- setNames(batch_key_shp$Batch, batch_key_shp$BatchName)
+stopifnot(all(rownames(W_pop50) %in% names(bn_to_wwtp)))
+
+rename_to_wwtp <- function(W) {
+  rownames(W) <- bn_to_wwtp[rownames(W)]
+  colnames(W) <- bn_to_wwtp[colnames(W)]
+  W[Batch_focus, Batch_focus, drop = FALSE]
+}
+W_pop50 <- rename_to_wwtp(W_pop50)
+
+# The W that goes into Stan.
+W_geo <- W_pop50
+
+stopifnot(identical(rownames(W_geo), Batch_focus),
+          identical(colnames(W_geo), Batch_focus),
+          identical(rownames(W_geo), colnames(y_batch)))
+
+cat(sprintf("W_geo: %d x %d (source = pop50)\n",
+            nrow(W_geo), ncol(W_geo)))
+```
+
+# 9 · Stan model (freesigma_vec variant) {background-color="#2c3e50"}
+
+## Read the `.stan` file from disk
+
+We **read** the freesigma_vec Stan file rather than write it inline.
+The source of truth for this model is
+`stan/renewal_A_fsv.stan`, which is shared with the NOTS
+script `run_stan_freesigma_vec.R`. This prevents drift between the qmd
+and the .R variants.
+
+Key model features:
+
+-   `log_beta ~ Normal(0, 4)` — weakly informative, \~5 orders of
+    magnitude on β.
+-   `sigma_obs_pl[p] ~ Half-Normal(0, 2)` (componentwise) — Gelman
+    (2006) prior for variance components.
+-   `sigma_obs_pl` is a **vector\[P\]**, one σ per plant. Cambio
+    principal vs el modelo scalar de freesigma.
+-   No `sigma_obs` data input, no `use_filter` flag.
+
+```{r}
+#| label: read-stan-model
+stan_path <- file.path(proj_root, "stan",
+                       "renewal_A_fsv_ar2.stan")
+stopifnot(file.exists(stan_path))
+
+cat("Using Stan model:\n  ", stan_path, "\n", sep = "")
+
+# Sanity preview: first 60 lines
+readLines(stan_path) |> head(60) |> writeLines()
+```
+
+# 10 · Build the Stan data list {background-color="#2c3e50"}
+
+```{r}
+#| label: build-stan-data
+# y in P x T (Stan convention); existing y_batch is T x P.
+y_PT <- t(y_batch)
+stopifnot(identical(rownames(y_PT), Batch_focus),
+          identical(rownames(W_geo), Batch_focus))
+
+# Mask + dummy fill for NA cells (Stan rejects NA in `data`).
+y_obs_mat <- matrix(as.integer(is.finite(y_PT) & y_PT > 0),
+                    nrow = nrow(y_PT), ncol = ncol(y_PT))
+y_filled  <- y_PT
+y_filled[y_obs_mat == 0] <- 1.0
+
+P <- length(Batch_focus)
+T <- ncol(y_PT)
+
+# NOTA rho=0: rho ES data fija (FIXED_RHO = 0). Sin coupling espacial.
+# sigma_obs_pl es parametro libre vector[P] (Half-Normal(0, 2)).
+build_stan_data <- function(...) {
+  list(
+    P            = P,
+    T            = T,
+    G            = G,
+    D            = D,
+    g            = as.numeric(g_vec),
+    d            = as.numeric(d_vec),
+    W            = W_geo,
+    rho          = FIXED_RHO,    # FIXED as data
+    It_init      = as.numeric(It_init_vec),
+    y            = y_filled,
+    y_obs        = y_obs_mat,
+    mean_gen_wk  = prior_mean_gen_days / 7,
+    sd_gen_wk    = prior_sd_gen_days   / 7
+  )
+}
+
+stan_data_demo <- build_stan_data()
+str(stan_data_demo, max.level = 1)
+cat(sprintf("
+rho FIXED at %.4f (independent epidemics baseline)
+", FIXED_RHO))
+```
+
+# 11 · Compile Stan model {background-color="#2c3e50"}
+
+```{r}
+#| label: compile-stan
+## stan_threads = TRUE matches the cached binary at stan/rsv_renewal_freesigma_vec,
+## so cmdstanr reuses it instead of recompiling. Edit the .stan content and
+## run `cmdstanr::rebuild_cmdstan()` once to refresh the PCH if needed.
+mod <- cmdstan_model(stan_file = stan_path, compile = TRUE,
+                     cpp_options = list(stan_threads = TRUE))
+
+cat("Compiled binary at:", mod$exe_file(), "\n")
+```
+
+# 12 · Single fit — rho = 0 baseline {background-color="#2c3e50"}
+
+## The single-fit run
+
+This baseline fits the model **once** with rho FIXED at 0 (independent
+epidemics). The fit is persisted to `outputs/stan_fits_fsv_ar2/rho_00.rds`.
+
+```{r}
+#| label: stan-sample-rho0
+#| eval: true
+
+RUN_SAMPLE <- TRUE
+
+fits_dir <- file.path(proj_root, "outputs", "stan_fits_fsv_ar2")
+dir.create(fits_dir, showWarnings = FALSE, recursive = TRUE)
+
+# init: sigma_obs_pl VECTOR[P] (Half-Normal(0, 2)). rho es data, no parametro.
+init_fun <- function(chain_id) {
+  list(
+    log_beta     = rep(0, P),
+    sigma_obs_pl = rep(1.0, P),
+    lam          = matrix(0.1, P, T),
+    It           = matrix(rep(It_init_vec, T), P, T)
+  )
+}
+init_list <- lapply(seq_len(n_chains), init_fun)
+
+if (RUN_SAMPLE) {
+  cat(sprintf("Sampling ONCE with rho FIXED at %.4f (independent epidemics)\n",
+              FIXED_RHO))
+  t0 <- Sys.time()
+
+  sd_one <- build_stan_data()
+  fit <- mod$sample(
+    data              = sd_one,
+    init              = init_list,
+    chains            = n_chains,
+    parallel_chains   = n_chains,
+    threads_per_chain = 1,
+    iter_warmup       = iter_warmup,
+    iter_sampling     = iter_sampling,
+    adapt_delta       = adapt_delta,
+    max_treedepth     = max_treedepth,
+    refresh           = 500,
+    seed              = 1729
+  )
+
+  cat(sprintf("\nSampling done in %.1f min\n",
+              as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+
+  cat("Extracting draws ...\n")
+  draws_arr <- fit$draws(
+    variables = c("log_beta", "beta", "sigma_obs_pl", "Rt", "It",
+                  "log_lik", "lp__"),
+    format = "draws_array")
+  diag_sum  <- fit$diagnostic_summary()
+  summary_tbl <- fit$summary(
+    variables = c("log_beta", "beta", "sigma_obs_pl", "Rt", "It",
+                  "lp__"),
+    rhat = posterior::rhat,
+    ess_bulk = posterior::ess_bulk,
+    ess_tail = posterior::ess_tail,
+    mean, sd,
+    q5  = ~ quantile(.x, 0.05),
+    q50 = ~ quantile(.x, 0.50),
+    q95 = ~ quantile(.x, 0.95)
+  )
+
+  cat(sprintf("\nrho FIXED at %.4f (no posterior)\n", FIXED_RHO))
+
+  save_object <- list(
+    rho_fixed             = FIXED_RHO,
+    model_variant         = "freesigma_vec_rho0_ar2",
+    draws                 = draws_arr,
+    diagnostic_summary    = diag_sum,
+    summary               = summary_tbl,
+    y_raw                 = y_PT,
+    y_obs_mask            = y_obs_mat,
+    d_vec                 = d_vec,
+    meta = list(
+      n_chains        = n_chains,
+      iter_warmup     = iter_warmup,
+      iter_sampling   = iter_sampling,
+      adapt_delta     = adapt_delta,
+      max_treedepth   = max_treedepth,
+      log_beta_prior  = "N(0, 4)",
+      sigma_obs_prior = "Half-Normal(0, 2) per plant",
+      rho_prior       = sprintf("FIXED at %.4f", FIXED_RHO),
+      ar_order        = "AR(2) on lambda with fixed (phi1, phi2) = (2, -1)",
+      save_time       = Sys.time()
+    )
+  )
+
+  rds_path <- file.path(fits_dir, "rho_00.rds")
+  tmp_path <- file.path(Sys.getenv("TMPDIR", tempdir()),
+                        sprintf("rho_00_%d.rds", Sys.getpid()))
+  saveRDS(save_object, tmp_path, compress = "gzip")
+  ok <- file.copy(tmp_path, rds_path, overwrite = TRUE)
+  if (!ok) stop("file.copy failed")
+  file.remove(tmp_path)
+  cat(sprintf("Saved fit -> %s  (%.1f MB)\n",
+              rds_path, file.size(rds_path) / 1e6))
+
+  fits <- list(rho_00 = save_object)
+} else {
+  rds_path <- file.path(fits_dir, "rho_00.rds")
+  if (file.exists(rds_path)) {
+    fits <- list(rho_00 = readRDS(rds_path))
+    cat("Loaded existing fit:", rds_path, "\n")
+  } else {
+    stop("No existing fit and RUN_SAMPLE = FALSE.")
+  }
+}
+
+# 13 · Convergence + rho posterior diagnostics {background-color="#2c3e50"}
+
+## R-hat, ESS, divergencias
+
+```{r}
+#| label: diagnostics-rho0
+#| eval: true
+if (RUN_SAMPLE || exists("fits")) {
+  fit_obj <- fits$rho_00
+  sm <- fit_obj$summary
+  # Resumen global de convergencia (todos los params)
+  diag_global <- data.frame(
+    n_divergent         = sum(fit_obj$diagnostic_summary$num_divergent),
+    n_max_treedepth     = sum(fit_obj$diagnostic_summary$num_max_treedepth),
+    rhat_max            = max(sm$rhat, na.rm = TRUE),
+    pct_rhat_above_1_01 = round(100 * mean(sm$rhat > 1.01, na.rm = TRUE), 2),
+    ess_bulk_min        = min(sm$ess_bulk, na.rm = TRUE),
+    pct_ess_below_400   = round(100 * mean(sm$ess_bulk < 400, na.rm = TRUE), 2)
+  )
+  knitr::kable(diag_global,
+               caption = sprintf("Convergence summary (rho FIXED at %.4f).",
+                                 FIXED_RHO))
+
+  # sigma_obs_pl posterior (per plant)
+  sigma_rows <- sm[grepl("^sigma_obs_pl", sm$variable), ]
+  cat(sprintf("\nsigma_obs_pl across %d plants: median = %.3f, range = [%.3f, %.3f]\n",
+              nrow(sigma_rows),
+              median(sigma_rows$mean),
+              min(sigma_rows$mean),
+              max(sigma_rows$mean)))
+}
+```
+
+# 14 · Notes and known limitations {background-color="#2c3e50"}
+
+-   **rho is FIXED at 0** (independent epidemics). This is the φ = 0
+    baseline for the AR(2) coupling experiment. The W matrix is built
+    but its contribution to the renewal mean is zero because
+    `(1 - rho) = 1`.
+-   **No MARSS Stage 1.** Raw `y` with NA mask, `sigma_obs_pl[p]` as a
+    free vector parameter (Half-Normal(0, 2) componentwise).
+-   **Comparison to the rho-est sibling.** Use `analyze_models_A.R`
+    (in the project root) to overlay this fit against
+    `A_fsv_est_ar2.qmd` (φ estimated). The contrast between Rt under
+    φ = 0 vs φ > 0 is the AR(2) version of the paper's Figure 7.
+-   **Wall-clock cost.** Single fit with 3 chains × 2000 warmup ×
+    8000 sampling and P = 15: expect ~2–4 hours on an 8-core Mac.
+-   **Output dir.** `.rds` lands at
+    `outputs/stan_fits_fsv_ar2/rho_00.rds` (single file). The
+    companion MARSS AR(2) rho = 0 variant uses
+    `stan/renewal_A_marss_ar2.stan` and saves to
+    `outputs/stan_fits_marss_ar2/`.

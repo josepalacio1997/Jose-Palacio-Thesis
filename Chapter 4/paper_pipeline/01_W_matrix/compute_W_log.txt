@@ -1,0 +1,22 @@
+Warning message:
+package ‘sf’ was built under R version 4.4.1 
+
+=== PEHD (Population-Extended Hausdorff Distance) ===
+  off-diag d range: [1.65, 49.23] km
+
+=== Euclidean (centroid-to-centroid) ===
+  off-diag d range: [4.17, 54.09] km
+
+=== HD (Classical Hausdorff Distance) ===
+  off-diag d range: [6.34, 57.19] km
+
+=== DONE ===
+Wrote: /Users/josepalacio/Documents/Claude/Projects/NOTS/rsv_mcmc_stan_geoW/Modelos AR con rho est. y rho=0/paper_pipeline/results/{W_PEHD, d_PEHD, W_eucl, d_eucl, W_HD, d_HD}.rds
+
+=== Pairwise comparison of the three W matrices ===
+cor(vec(W_PEHD), vec(W_eucl))  : 0.9825
+cor(vec(W_PEHD), vec(W_HD))    : 0.9743
+cor(vec(W_eucl), vec(W_HD))    : 0.9803
+max |W_PEHD - W_eucl|          : 0.0910
+max |W_PEHD - W_HD|            : 0.1096
+max |W_eucl - W_HD|            : 0.0387
