@@ -1,0 +1,2241 @@
+---
+title: "Bayes_Rt_It_Model"
+author: "Jose Palacio"
+format: html
+editor: visual
+---
+
+```{r}
+# ============================================================
+# RSV Wastewater Pipeline — Organized & Commented
+# Jose Palacio — clean, modular R script
+# Notes:
+#   • Short, natural English comments explain each function and step.
+#   • NIMBLE model code is commented line-by-line.
+#   • Keep sections independent so you can source pieces in other projects.
+# ============================================================
+
+# ------------------------------------------------------------
+# 0) Packages & global options
+# ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(tidyverse)   # data wrangling + ggplot2
+  library(lubridate)   # dates
+  library(MARSS)       # state-space (Kalman) on log scale
+  library(KFAS)        # extract filtered states from MARSS fits
+  library(glue)        # tidy string helpers
+  library(scales)      # axis labels
+  library(ggnewscale)  # multiple color scales
+  library(posterior)   # draws handling (optional)
+  library(kableExtra)  # tables (optional)
+  library(forecast)    # misc TS tools (optional)
+  library(patchwork)
+  library(qcc)         # control charts (optional)
+  library(astsa)       # TS helpers (optional)
+  library(tseries)     # TS tests (optional)
+  library(loo)         # WAIC/LOO utilities
+  library(truncnorm)   # truncated normals
+  library(nimble)      # MCMC and custom models
+  library(ern)         # ERN pkg if you compare methods
+  library(readr); library(dplyr); library(tidyr); library(ggplot2)
+  library(tibble); library(htmltools); library(plotly)
+  library(htmlwidgets); library(webshot); library(webshot2); library(knitr)
+})
+
+nimbleOptions(clearNimbleFunctionsAfterCompiling = TRUE)
+set.seed(123)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 1) Helper: build a wide T×(1+P) frame from long data
+#    - Keeps column order consistent and fills missing plants
+# ------------------------------------------------------------
+make_wide_matrix <- function(df, value_col, plants_order) {
+  df %>%
+    mutate(.val = {{ value_col }}) %>%             # capture the column/expression as .val
+    select(Date, WWTP, .val) %>%                   # only the columns we need
+    tidyr::pivot_wider(                            # long → wide; one column per plant
+      names_from = WWTP, values_from = .val,
+      values_fill = NA_real_
+    ) %>%
+    arrange(Date) %>%
+    {
+      wide <- .
+      missing_cols <- setdiff(plants_order, names(wide)) # ensure all plants exist as columns
+      if (length(missing_cols)) for (m in missing_cols) wide[[m]] <- NA_real_
+      wide %>% select(all_of(c("Date", plants_order))) # enforce column order
+    }
+}
+```
+
+```{r}
+# ------------------------------------------------------------
+# 2) Load RSV rows and basic cleaning
+#    - Expect: date, WWTP, tn (pathogen), log10cpl, flow_interp (L/day)
+#    - If flow is in MGD, convert before this step
+# ------------------------------------------------------------
+ww <- read_csv("~/Downloads/all_ts_observed_ILI.csv", show_col_types = FALSE) %>%
+  mutate(WWTP = toupper(WWTP), tn = toupper(tn)) %>%
+  filter(WWTP != "SS", tn == "RSV") %>%
+  transmute(
+    Batch    = BATCH,
+    WWTP,
+    Date     = as.Date(date),
+    Pathogen = tn,
+    copies_day,
+    lcopies_day,
+    copies_L,
+    log10cpl,
+    Flow     = flow_interp     # L/day
+  ) %>%
+  arrange(WWTP, Date)
+
+
+library(dplyr)
+
+ww_batch <- ww %>%
+  group_by(Batch, Date, Pathogen) %>%     # si Pathogen siempre es RSV, es más por claridad
+  summarise(
+    copies_day = mean(copies_day, na.rm = TRUE),
+    n_plants   = n_distinct(WWTP),        # cuántas plantas entraron en ese batch
+    .groups    = "drop"
+  )
+
+
+
+population <- read_csv("~/Downloads/all_ts_observed_ILI.csv", show_col_types = FALSE) %>%
+  mutate(WWTP = toupper(WWTP), tn = toupper(tn)) %>%
+  filter(tn == "RSV", WWTP != "SS") %>%
+  select(WWTP, pop) %>%
+  distinct() %>%
+  filter(!is.na(pop)) %>%                        # opcional: descarta pop NA del denominador
+  mutate(
+    prop     = pop / sum(pop),                   # proporción por planta
+    avg_case = pmax(1L, as.integer(round(213 * prop)))  # mínimo 1
+  )
+
+conc_codes   <- sort(unique(ww$WWTP))
+WWTP_focus   <- c("69")
+WWTP_focus   <- WWTP_focus[WWTP_focus %in% conc_codes]
+plants_order <- WWTP_focus
+avg_cases <- population  %>%filter(WWTP == WWTP_focus) %>% select(avg_case)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 3) Burn-in and trimming
+#    - Drop early dates (stabilization period)
+# ------------------------------------------------------------
+burnin <- 15
+
+date_burnin <- ww %>%
+  filter(WWTP %in% WWTP_focus) %>%
+  summarise(date_burnin = dplyr::nth(sort(unique(Date)), burnin, default = max(Date))) %>%
+  pull(date_burnin)
+
+ww_rsv <- ww %>%
+  filter(WWTP %in% WWTP_focus, Date > date_burnin, Date >= as.Date("2023-01-02")) %>%
+  mutate(
+    Missing = is.na(log10cpl),
+    cpl     = copies_L                # gc/L
+  ) %>%
+  relocate(WWTP, Date, Pathogen, log10cpl, cpl, Flow, Missing) %>%
+  arrange(WWTP, Date) %>%
+  select(-c("copies_L"))
+
+dates_rsv <- sort(unique(ww_rsv$Date))
+Tt <- length(dates_rsv)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 4) Median flow per plant (constant across time for CPD calc)
+#    - We purposely use the plant-level median to reduce noise
+# ------------------------------------------------------------
+median_flow_tbl <- ww_rsv %>%
+  group_by(WWTP) %>%
+  summarise(Flow_median = median(Flow, na.rm = TRUE), .groups = "drop")
+
+median_flow_vec <- median_flow_tbl %>%
+  right_join(tibble(WWTP = plants_order), by = "WWTP") %>%
+  arrange(WWTP) %>%
+  pull(Flow_median)
+
+median_flow_TxP <- matrix(rep(median_flow_vec, each = Tt), nrow = Tt, ncol = length(plants_order))
+```
+
+```{r}
+# ------------------------------------------------------------
+# 5) CPD in billions & log transforms
+# ------------------------------------------------------------
+# gc/L wide matrix
+wide_cpl <- make_wide_matrix(ww_rsv, value_col = cpl, plants_order)
+mat_rsv_cpl <- as.matrix(wide_cpl[,-1])                      # T×P (gc/L)
+
+# Billions of copies/day (using median flow)
+mat_rsv_cpd_b <- (mat_rsv_cpl * median_flow_TxP) / 1e9      # T×P (billions CPD)
+wide_cpd_b <- wide_cpl; wide_cpd_b[,-1] <- mat_rsv_cpd_b
+
+mat_rsv_cpd_log10 <- 10^ww_rsv$lcopies_day/1e9 #log10(mat_rsv_cpd_b)
+
+# Log10 versions
+mat_rsv_log10cpl   <- log10(mat_rsv_cpl)        # T×P
+mat_rsv_log10cpd_b <- log10(mat_rsv_cpd_b)
+
+# Long frames for plots
+df_long_cpl_b <- make_wide_matrix(ww_rsv, value_col = cpl, plants_order) %>%
+  pivot_longer(-Date, names_to = "WWTP", values_to = "cpl_b") %>%
+  left_join(ww_rsv %>% select(WWTP, Date, Missing) %>% distinct(), by = c("WWTP","Date")) %>%
+  arrange(WWTP, Date)
+
+df_long_cpd_b <- wide_cpd_b %>%
+  pivot_longer(-Date, names_to = "WWTP", values_to = "cpd_b") %>%
+  arrange(WWTP, Date)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 6) Quick plots (billions)
+#    - Grey shades mark missing cpl values
+# ------------------------------------------------------------
+dt_tbl <- df_long_cpl_b %>%
+  group_by(WWTP) %>%
+  summarise(dt = median(as.numeric(diff(sort(unique(Date)))), na.rm = TRUE), .groups = "drop") %>%
+  mutate(dt = ifelse(is.na(dt) | dt <= 0, 7, dt))
+
+date_rng <- range(df_long_cpl_b$Date, na.rm = TRUE)
+
+shades <- df_long_cpl_b %>%
+  filter(coalesce(Missing, FALSE)) %>%
+  left_join(dt_tbl, by = "WWTP") %>%
+  transmute(
+    WWTP,
+    xmin = pmax(Date - dt/2, date_rng[1]),
+    xmax = pmin(Date + dt/2, date_rng[2]),
+    ymin = -Inf,
+    ymax =  Inf
+  )
+
+p_cpl_b <- ggplot(df_long_cpl_b, aes(Date, cpl_b)) +
+  geom_rect(data = shades,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            inherit.aes = FALSE, fill = "grey70", alpha = 0.30) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(x = "Date", y = "copies per liter (gc/L)",
+       title = "RSV concentration (gc/L), grey = missing") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+
+p_cpd_b <- ggplot(df_long_cpd_b, aes(Date, cpd_b)) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(x = "Date", y = "Billions of copies per day (10^9 cp/day)",
+       title = "RSV load (billions copies/day) — median flow per plant") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+
+# dir.create("Plots", showWarnings = FALSE, recursive = TRUE)
+# ggsave("Plots/RSV_cpl_billions_medianFlow.png", p_cpl_b, width = 8, height = 6, dpi = 300)
+# ggsave("Plots/RSV_cpd_billions_medianFlow.png", p_cpd_b, width = 8, height = 6, dpi = 300)
+print(p_cpl_b); print(p_cpd_b)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 7a) MARSS on log10(billions CPD) — simple 2-dim state
+#    - We fit, then map back to natural scale with lognormal correction
+# ------------------------------------------------------------
+model.spec <- list(
+  B  = matrix(c(2,1,-1,0), 2, 2, byrow = TRUE), # simple stable 2×2 dynamics
+  U  = "zero",                                   # no intercept in state eq
+  Q  = "diagonal and equal",                    # same process var per state
+  V0 = "identity",                              # initial state var
+  x0 = "equal",                                 # same initial mean
+  R  = "diagonal and equal",                    # obs noise (equal across plants)
+  A  = "zero",                               # no mean offset in obs eq
+  Z  = { Ztmp <- matrix(list(0), nrow = length(plants_order), ncol = 2);
+         Ztmp[,1] <- 1; Ztmp }                   # first state loads on all plants
+)
+
+fit_cpd_b <- MARSS(t(mat_rsv_log10cpd_b), model = model.spec,
+                   method = "BFGS", silent = TRUE, control = list(trace = 1))
+
+# Filtered states → plant scale (natural units, billions CPD) with lognormal correction
+kfas <- MARSSkfas(fit_cpd_b)
+xtt  <- kfas$xtt                             # m × T (filtered means)
+Vtt  <- kfas$Vtt                            # m × m × T (filtered covariances)
+M    <- coef(fit_cpd_b, type = "matrix")
+Z    <- as.matrix(M$Z)                       # P × m
+R    <- as.matrix(M$R)                       # P × P (log10 scale)
+P    <- nrow(Z); Tt <- ncol(xtt)
+
+R_log10 <- as.matrix(M$R)
+sd_log10_obs <- sqrt(diag(R_log10))
+sigma_ln <- log(10) * sd_log10_obs
+
+mu_log10 <- sd_log10 <- matrix(NA_real_, P, Tt)
+for (t in 1:Tt) {
+  mu_log10[, t] <- drop(Z %*% xtt[, t])                # mean on log10 scale
+  Sigma_y_t     <- Z %*% Vtt[,, t] %*% t(Z)        # var on log10 scale
+  sd_log10[, t] <- sqrt(pmax(diag(Sigma_y_t), 0))
+}
+
+ln10   <- log(10)
+
+  
+sdlog_TxP   <- t(ln10 * sd_log10)
+mu_ln  <- ln10 * mu_log10
+var_ln <- (ln10^2) * (sd_log10^2)
+mean_cpd_b <- exp(mu_ln + 0.5 * var_ln)               # mean on natural scale
+log((exp(sdlog_TxP^2)-1)*(exp(2*t(mu_ln) + sdlog_TxP^2)))
+
+df_cpd_b_est <- tibble(
+  Date = rep(dates_rsv, each = P),
+  WWTP = rep(plants_order, times = Tt),
+  mean = as.vector(mean_cpd_b),
+  sd   = as.vector(sd_cpd_b),
+  lwr  = pmax(mean - 1.96*sd, 0),
+  upr  = mean + 1.96*sd
+)
+
+p_marss <- ggplot(df_cpd_b_est, aes(Date, mean)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+  geom_line() +
+  geom_point(data = df_long_cpd_b, aes(y = cpd_b), size = 0.7, alpha = 0.7) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = "RSV — MARSS estimated vs observed (billions CPD, median flow)",
+       x = "Date", y = "Billions of copies per day (10^9 cp/day)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+
+print(p_marss)
+
+# P×T pseudo-observations for downstream models
+y_kf_cpd_TxP_b <- t(mean_cpd_b)                     # T×P (means on natural scale)
+sigma_cpd_b    <- t(sqrt(var_ln))   # T×P (sd on ln-scale)
+
+# ------------------------------------------------------------
+# 7b) MARSS on log10(CPL) — simple 2-dim state
+#    - We fit, then map back to natural scale with lognormal correction
+# ------------------------------------------------------------
+fit_cpl <- MARSS(t(mat_rsv_log10cpl), model = model.spec,
+                   method = "BFGS", silent = TRUE, control = list(trace = 1))
+# Filtered states → plant scale (natural units, gc/L) with lognormal correction
+kfas_cpl <- MARSSkfas(fit_cpl)
+xtt_cpl  <- kfas_cpl$xtt                             # m × T (filtered means)
+Vtt_cpl  <- kfas_cpl$Vtt                             # m × m × T (filtered covariances)
+M_cpl    <- coef(fit_cpl, type = "matrix")
+Z_cpl    <- as.matrix(M_cpl$Z)                       # P × m
+R_cpl    <- as.matrix(M_cpl$R)                       # P × P (log10 scale)
+P        <- nrow(Z_cpl); Tt <- ncol(xtt_cpl)
+mu_log10_cpl <- sd_log10_cpl <- matrix(NA_real_, P, Tt)
+for (t in 1:Tt) {
+  mu_log10_cpl[, t] <- drop(Z_cpl %*% xtt_cpl[, t])                # mean on log10 scale
+  Sigma_y_t         <- Z_cpl %*% Vtt_cpl[,, t] %*% t(Z_cpl) + R_cpl        # var on log10 scale
+  sd_log10_cpl[, t] <- sqrt(pmax(diag(Sigma_y_t), 0))
+}
+mu_ln_cpl  <- ln10 * mu_log10_cpl
+var_ln_cpl <- (ln10^2) * (sd_log10_cpl^2)
+sigma_ln_cpl <- t(sqrt(var_ln_cpl))   # T×P (sd on ln-scale)
+mean_cpl <- exp(mu_ln_cpl + 0.5 * var_ln_cpl) # mean on natural scale
+y_kf_cpl_TxP <- t(mean_cpl) # T×P (means on natural scale)
+
+sd_cpl   <- sqrt((exp(var_ln_cpl) - 1) * exp(2 * mu_ln_cpl + var_ln_cpl))
+df_cpl_est <- tibble(
+  Date = rep(dates_rsv, each = P),
+  WWTP = rep(plants_order, times = Tt),
+  mean = as.vector(mean_cpl),
+  sd   = as.vector(sd_cpl),
+  lwr  = pmax(mean - 1.96*sd, 0),
+  upr  = mean + 1.96*sd
+)
+p_marss_cpl <- ggplot(df_cpl_est, aes(Date, mean)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+  geom_line() +
+  geom_point(data = df_long_cpl_b, aes(y = cpl_b), size = 0.7, alpha = 0.7) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = "RSV — MARSS estimated vs observed (gc/L)",
+       x = "Date", y = "copies per liter (gc/L)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+print(p_marss_cpl)
+```
+
+```{r}
+# ============================================================
+# Plot genérico para estimados filtrados en escala log10
+# ============================================================
+plot_log10_filtered <- function(mu_log10, sd_log10, dates, plants, y_obs_log10,
+                                ylab = expression(log[10]~("value")),
+                                title = "Filtered vs observed (log10)") {
+  P  <- length(plants)
+  Tt <- length(dates)
+
+  df_est <- tibble(
+    Date = rep(dates, each = P),
+    WWTP = rep(plants, times = Tt),
+    mean = as.vector(mu_log10),
+    sd   = as.vector(sd_log10),
+    lwr  = mean - 1.96 * sd,
+    upr  = mean + 1.96 * sd
+  )
+
+  df_obs <- tibble(
+    Date = rep(dates, each = P),
+    WWTP = rep(plants, times = Tt),
+    y    = as.vector(y_obs_log10)
+  )
+
+  ggplot(df_est, aes(Date, mean)) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+    geom_line() +
+    geom_point(data = df_obs, aes(y = y), size = 0.7, alpha = 0.7) +
+    facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+    labs(title = title, x = "Date", y = ylab) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          strip.text  = element_text(face = "bold"),
+          legend.position = "none")
+}
+
+# ============================================================
+# 1) LOG10(CPD) — usa objetos de la sección 7a
+#    mu_log10, sd_log10 ya calculados arriba para CPD
+# ============================================================
+# Observaciones en log10(CPD) (T×P)
+y_obs_log10_cpd <- mat_rsv_log10cpd_b  # ya lo tienes
+
+p_log10_cpd <- plot_log10_filtered(
+  mu_log10   = mu_log10,          # P×T
+  sd_log10   = sd_log10,          # P×T
+  dates      = dates_rsv,
+  plants     = plants_order,
+  y_obs_log10= y_obs_log10_cpd,   # T×P
+  ylab       = expression(log[10]~"copies/day"),
+  title      = "RSV — MARSS filtered vs observed (log10 CPD, median flow)"
+)
+print(p_log10_cpd)
+
+# ============================================================
+# 2) LOG10(CPL) — usa objetos de la sección 7b
+#    mu_log10_cpl, sd_log10_cpl ya calculados para CPL
+# ============================================================
+y_obs_log10_cpl <- mat_rsv_log10cpl     # T×P
+
+p_log10_cpl <- plot_log10_filtered(
+  mu_log10   = mu_log10_cpl,       # P×T
+  sd_log10   = sd_log10_cpl,       # P×T
+  dates      = dates_rsv,
+  plants     = plants_order,
+  y_obs_log10= y_obs_log10_cpl,    # T×P
+  ylab       = expression(log[10]~"copies/L"),
+  title      = "RSV — MARSS filtered vs observed (log10 CPL)"
+)
+print(p_log10_cpl)
+
+# Usar SMOOTHED states en vez de FILTERED
+kfas <- MARSSkfas(fit_cpd_b)
+x_sm  <- kfas$xtt            # m × T
+V_sm  <- kfas$Vtt            # m × m × T
+
+M    <- coef(fit_cpd_b, type = "matrix")
+Z    <- as.matrix(M$Z)       # P × m
+R    <- as.matrix(M$R)       # P × P (log10)
+
+P <- nrow(Z); Tt <- ncol(x_sm)
+
+# Elige si incluir R (observación esperada) o no (señal latente)
+include_R <- FALSE  # <-- pon TRUE si quieres las bandas de "y_t" con ruido de medición
+
+mu_log10 <- sd_log10 <- matrix(NA_real_, P, Tt)
+for (t in 1:Tt) {
+  mu_log10[, t] <- drop(Z %*% x_sm[, t])
+  Sigma_t <- Z %*% V_sm[,, t] %*% t(Z)
+  if (include_R) Sigma_t <- Sigma_t + R
+  sd_log10[, t] <- sqrt(pmax(diag(Sigma_t), 0))
+}
+
+# Bandas CORRECTAS para lognormal: calcular en log10 y luego transformar
+lwr_nat <- 10^(mu_log10 - 1.96*sd_log10)
+upr_nat <- 10^(mu_log10 + 1.96*sd_log10)
+
+# Para la curva central en natural, usa la MEDIANA (más robusta que la media)
+median_nat <- 10^(mu_log10)
+
+df_cpd_b_est <- tibble(
+  Date = rep(dates_rsv, each = P),
+  WWTP = rep(plants_order, times = Tt),
+  med  = as.vector(median_nat),
+  lwr  = as.vector(lwr_nat),
+  upr  = as.vector(upr_nat)
+)
+
+p_marss_tight <- ggplot(df_cpd_b_est, aes(Date, med)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+  geom_line() +
+  geom_point(data = df_long_cpd_b, aes(y = cpd_b), size = 0.7, alpha = 0.7) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = glue("RSV — MARSS {if (include_R) 'expected obs' else 'latent signal'} vs observed (CPD)"),
+       x = "Date", y = "Copies Per Day (cp/day)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+print(p_marss_tight)
+
+df_log10 <- tibble(
+  Date = rep(dates_rsv, each = P),
+  WWTP = rep(plants_order, times = Tt),
+  mean = as.vector(mu_log10),
+  lwr  = as.vector(mu_log10 - 1.96*sd_log10),
+  upr  = as.vector(mu_log10 + 1.96*sd_log10),
+  obs  = as.vector(mat_rsv_log10cpd_b)
+)
+
+ggplot(df_log10, aes(Date, mean)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+  geom_line() +
+  geom_point(aes(y = obs), size = 0.7, alpha = 0.7) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = "RSV — MARSS filtered (log10 CPD)", y = expression(log[10]~"copies/day")) +
+  theme_minimal()
+```
+
+```{r}
+# Construye el long data frame en cp/day
+df_long_cpd <- tibble(
+  Date = rep(dates_rsv, each = length(plants_order)),
+  WWTP = rep(plants_order, times = length(dates_rsv)),
+  cpd  = as.vector(mat_rsv_cpd_b)   # matriz T×P en cp/day
+)
+
+mu_ln  <- log(10) * mu_log10
+var_ln <- (log(10)^2) * (sd_log10^2)
+median_cpd <- exp(mu_ln)  # mediana lognormal en cp/day
+lwr_cpd    <- exp(mu_ln - 1.96*sqrt(var_ln))
+upr_cpd    <- exp(mu_ln + 1.96*sqrt(var_ln))
+
+df_est <- tibble(
+  Date = rep(dates_rsv, each = P),
+  WWTP = rep(plants_order, times = Tt),
+  med  = as.vector(median_cpd),
+  lwr  = as.vector(lwr_cpd),
+  upr  = as.vector(upr_cpd)
+)
+
+ggplot(df_est, aes(Date, med)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), alpha=.15) +
+  geom_line() +
+  geom_point(data = df_long_cpd, aes(y = cpd), size=.7, alpha=.7) +  # <-- cp/day
+  labs(title="RSV — MARSS latent vs observed (CPD)",
+       y="Copies per day (cp/day)")
+```
+
+```{r}
+# ---------- A.1  gc/L wide & log10 ----------
+wide_cpl       <- make_wide_matrix(ww_rsv, value_col = cpl, plants_order)
+mat_rsv_cpl    <- as.matrix(wide_cpl[,-1])             # T×P (gc/L)
+mat_rsv_log10cpl <- log10(mat_rsv_cpl)                 # T×P
+
+# ---------- A.2  long tidy para plots ----------
+df_long_cpl <- make_wide_matrix(ww_rsv, value_col = cpl, plants_order) %>%
+  pivot_longer(-Date, names_to = "WWTP", values_to = "cpl") %>%
+  left_join(ww_rsv %>% select(WWTP, Date, Missing) %>% distinct(), by = c("WWTP","Date")) %>%
+  arrange(WWTP, Date)
+
+# ---------- B.1  MARSS sobre log10(CPL) ----------
+fit_cpl <- MARSS(t(mat_rsv_log10cpl), model = model.spec,
+                 method = "BFGS", silent = TRUE, control = list(trace = 1))
+
+kfas_cpl <- MARSSkfas(fit_cpl)
+xtt_cpl  <- kfas_cpl$xtt            # m × T
+Vtt_cpl  <- kfas_cpl$Vtt            # m × m × T
+M_cpl    <- coef(fit_cpl, type = "matrix")
+Z_cpl    <- as.matrix(M_cpl$Z)      # P × m
+R_cpl    <- as.matrix(M_cpl$R)      # P × P (en log10)
+
+P <- nrow(Z_cpl); Tt <- ncol(xtt_cpl)
+mu_log10_cpl <- sd_log10_cpl <- matrix(NA_real_, P, Tt)
+for (t in 1:Tt) {
+  mu_log10_cpl[, t] <- drop(Z_cpl %*% xtt_cpl[, t])
+  Sigma_y_t         <- Z_cpl %*% Vtt_cpl[,, t] %*% t(Z_cpl) + R_cpl
+  sd_log10_cpl[, t] <- sqrt(pmax(diag(Sigma_y_t), 0))
+}
+
+# ---------- B.2  pasar a natural (gc/L) con corrección lognormal ----------
+ln10          <- log(10)
+meanlog_TxP   <- t(ln10 * mu_log10_cpl)                  # T×P, ln-mean
+sdlog_TxP_cpl     <- t(ln10 * sd_log10_cpl)                  # T×P, ln-sd
+y_kf_cpl_TxP  <- exp(meanlog_TxP + 0.5 * (sdlog_TxP^2))  # T×P, media natural (gc/L)
+
+# (opcional) bandas en natural, si quieres plotear:
+lwr_cpl <- exp(meanlog_TxP - 1.96*sdlog_TxP)
+upr_cpl <- exp(meanlog_TxP + 1.96*sdlog_TxP)
+
+
+# ---------- C.1  Observado gc/L ----------
+p_cpl <- ggplot(df_long_cpl, aes(Date, cpl)) +
+  geom_rect(data = {
+      dt_tbl <- df_long_cpl %>%
+        group_by(WWTP) %>% summarise(dt = median(as.numeric(diff(sort(unique(Date)))), na.rm = TRUE), .groups = "drop") %>%
+        mutate(dt = ifelse(is.na(dt) | dt <= 0, 7, dt))
+      range_dates <- range(df_long_cpl$Date, na.rm = TRUE)
+      df_long_cpl %>% filter(coalesce(Missing, FALSE)) %>%
+        left_join(dt_tbl, by = "WWTP") %>%
+        transmute(WWTP,
+                  xmin = pmax(Date - dt/2, range_dates[1]),
+                  xmax = pmin(Date + dt/2, range_dates[2]),
+                  ymin = -Inf, ymax = Inf)
+    },
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE, fill = "grey70", alpha = 0.30) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(x = "Date", y = "copies per liter (gc/L)",
+       title = "RSV concentration (gc/L), grey = missing") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+
+print(p_cpl)
+
+# ---------- C.2  MARSS (media natural gc/L) vs observado ----------
+df_cpl_est <- tibble(
+  Date = rep(dates_rsv, each = P),
+  WWTP = rep(plants_order, times = Tt),
+  mean = as.vector(y_kf_cpl_TxP),
+  lwr  = as.vector(lwr_cpl),
+  upr  = as.vector(upr_cpl)
+)
+
+p_marss_cpl <- ggplot(df_cpl_est, aes(Date, mean)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+  geom_line() +
+  geom_point(data = df_long_cpl, aes(y = cpl), size = 0.7, alpha = 0.7) +
+  facet_wrap(~ WWTP, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = "RSV — MARSS estimated vs observed (gc/L)",
+       x = "Date", y = "copies per liter (gc/L)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(face = "bold"),
+        legend.position = "none")
+
+print(p_marss_cpl)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 8) General helpers for renewal/Kalman linkage
+# ------------------------------------------------------------
+assert_data_ok <- function(y_PT, sigma_obs_PT_or_NULL = NULL) {
+  # Quick sanity checks on input matrices
+  stopifnot(is.matrix(y_PT), all(is.finite(y_PT) | is.na(y_PT)))
+  if (!is.null(sigma_obs_PT_or_NULL)) {
+    stopifnot(is.matrix(sigma_obs_PT_or_NULL))
+    stopifnot(all(dim(sigma_obs_PT_or_NULL) == dim(y_PT)))
+  }
+}
+
+# Collapse T×P or P×T sigmas into a per-plant vector via median (robust)
+sigma_obs_to_vec <- function(sig_mat, y_is_T_by_P) {
+  if (y_is_T_by_P) {
+    apply(sig_mat, 2, function(v) median(v[is.finite(v)], na.rm = TRUE))
+  } else {
+    apply(sig_mat, 1, function(v) median(v[is.finite(v)], na.rm = TRUE))
+  }
+}
+
+# Ensure P×T orientation (convenience for NIMBLE)
+as_PT_matrix <- function(y, y_is_T_by_P = TRUE) {
+  y <- as.matrix(y)
+  if (y_is_T_by_P) t(y) else y
+}
+
+# Gamma params from mean/sd in days (return weeks)
+to_gamma <- function(mean_days, sd_days){
+  m <- mean_days/7; s <- sd_days/7
+  list(shape = (m^2)/(s^2), scale = (s^2)/m)
+}
+
+# Discrete generation (g, 1..K) and shedding (d, 0..K) kernels
+make_kernels <- function(mean_gen_days, sd_gen_days,
+                         mean_shed_days, sd_shed_days, K = 3) {
+  par_g <- to_gamma(mean_gen_days,  sd_gen_days)
+  par_d <- to_gamma(mean_shed_days, sd_shed_days)
+
+  # g over {1,2,...,K}
+  edges_g_hi <- seq(1.5, K + 0.5, by = 1)
+  w_g <- pgamma(edges_g_hi,     shape = par_g$shape, scale = par_g$scale) -
+         pgamma(edges_g_hi - 1, shape = par_g$shape, scale = par_g$scale)
+  w_g <- pmax(w_g, 0); w_g <- w_g / sum(w_g)
+
+  # d over {0,1,...,K}
+  edges_d <- c(-0.5, seq(0.5, K + 0.5, by = 1))
+  F_d <- pgamma(pmax(edges_d, 0), shape = par_d$shape, scale = par_d$scale)
+  w_d <- diff(F_d)
+  w_d <- pmax(w_d, 0); w_d <- w_d / sum(w_d)
+
+  list(g = w_g, d = w_d)
+}
+
+# Optional: visualize the continuous gamma shapes in weeks
+plot_gamma_pdfs_weeks <- function(mean_gen_days  = 7.5, sd_gen_days  = 2.1,
+                                  mean_shed_days = 4.6, sd_shed_days = 2.0,
+                                  n = 600, save_png = NULL) {
+  par_g <- to_gamma(mean_gen_days,  sd_gen_days)
+  par_d <- to_gamma(mean_shed_days, sd_shed_days)
+  tmax <- max((mean_gen_days + 3*sd_gen_days)/7,
+              (mean_shed_days + 3*sd_shed_days)/7)
+  t <- seq(0, tmax, length.out = n)
+
+  df <- bind_rows(
+    tibble(
+      t = t,
+      density = dgamma(t, shape = par_g$shape, scale = par_g$scale),
+      kernel = glue("Generation (shape={round(par_g$shape,2)}, scale={round(par_g$scale,2)})")
+    ),
+    tibble(
+      t = t,
+      density = dgamma(t, shape = par_d$shape, scale = par_d$scale),
+      kernel = glue("Shedding (shape={round(par_d$shape,2)}, scale={round(par_d$scale,2)})")
+    )
+  )
+
+  p <- ggplot(df, aes(t, density, color = kernel)) +
+    geom_line(linewidth = 1) +
+    labs(title = "Continuous Gamma (weeks)", x = "Time (weeks)", y = "Density", color = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "top")
+
+  if (!is.null(save_png)) ggsave(save_png, p, width = 8, height = 4.5, dpi = 300)
+  p
+}
+
+plot_gamma_pdfs_weeks(mean_gen_days = 7.5, sd_gen_days = 2.1,
+                      mean_shed_days = 4.6, sd_shed_days = 2.0)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 9) NIMBLE low-level helpers (small, focused)
+# ------------------------------------------------------------
+# Convolution sum over x[t-k] * w[k], k = 1..len (generation-style)
+convSum <- nimble::nimbleFunction(
+  run = function(t = integer(0), x = double(1), len = integer(0), w = double(1)) {
+    returnType(double(0))
+    out <- 0.0
+    for (k in 1:len) if (t - k >= 1) out <- out + x[t - k] * w[k]
+    return(out)
+  })
+
+# Convolution sum over x[t-k] * w[k+1], k = 0..len-1 (shedding-style with lag 0)
+convSum0 <- nimble::nimbleFunction(
+  run = function(t = integer(0), x = double(1), len = integer(0), w = double(1)) {
+    returnType(double(0))
+    out <- 0.0
+    for (k in 0:(len - 1)) if (t - k >= 1) out <- out + x[t - k] * w[k + 1]
+    return(out)
+  })
+
+# Numerically stable softplus: log(1 + exp(x)) for x<0, x + log(1+exp(-x)) for x>0
+softplus_stable <- nimble::nimbleFunction(
+  run = function(x = double(0)) {
+    returnType(double(0))
+    if (x > 0) return(x + log(1 + exp(-x))) else return(log(1 + exp(x)))
+  })
+```
+
+```{r}
+# ------------------------------------------------------------
+# 10) MAIN: Renewal model in NIMBLE (commented line-by-line)
+#      - y: measurements on natural scale (e.g., billions CPD)
+#      - sigma_mode controls obs sd on ln-scale: fixed/plant/time/scalar
+# ------------------------------------------------------------
+fit_rsv_renewal_nimble <- function(
+  y,                        # data: T×P (default) or P×T
+  y_is_T_by_P = TRUE,       # set FALSE if y is P×T already
+  sigma_mode = c("fixed","plant","time","scalar"),
+  sigma_input = NULL,       # fixed: vector P or matrix P×T/T×P (sd on ln)
+  mean_gen_days  = 7.5, sd_gen_days  = 2.1,
+  mean_shed_days = 4.6, sd_shed_days = 2.0,
+  K = 4,                   # kernel truncation length
+  estimate_beta = TRUE, beta_fixed = NULL,
+  iter = 50000, nburnin = NULL, thin = 1, nchains = 4,
+  seed = 123,
+  rw_logsigma0 = log(0.7), # prior center for log σ (time-varying mode)
+  rw_sd_init   = 0.3,      # RW step sd (time-varying mode)
+  inits_list = NULL
+){
+  set.seed(seed)
+  sigma_mode <- match.arg(sigma_mode)
+
+  # Orient as P×T for NIMBLE arrays
+  y_PT <- as_PT_matrix(y, y_is_T_by_P = y_is_T_by_P)
+  P <- nrow(y_PT); Tt <- ncol(y_PT)
+
+  # Build discrete kernels
+  ks <- make_kernels(mean_gen_days, sd_gen_days, mean_shed_days, sd_shed_days, K)
+  g <- ks$g; d <- ks$d; G <- length(g); D <- length(d)
+
+  # Select sigma mode constant to branch inside model
+  SIGMA_MODE <- switch(sigma_mode, fixed=0L, plant=1L, time=2L, scalar=3L)
+
+  sigma_fixed_PT <- NULL
+  sigma_scalar   <- NULL
+
+  if (SIGMA_MODE == 0L) {                 # fixed P×T or per-plant
+    if (is.null(sigma_input))
+      stop("sigma_mode='fixed' requires sigma_input (vector P or matrix P×T/T×P) on ln sd.")
+    if (is.vector(sigma_input)) {
+      stopifnot(length(sigma_input) == P, all(is.finite(sigma_input)), all(sigma_input > 0))
+      sigma_fixed_PT <- matrix(as.numeric(sigma_input), nrow = P, ncol = Tt)
+    } else if (is.matrix(sigma_input)) {
+      if (all(dim(sigma_input) == c(P, Tt))) sigma_fixed_PT <- sigma_input else
+      if (all(dim(sigma_input) == c(Tt, P))) sigma_fixed_PT <- t(sigma_input) else
+        stop("sigma_input must be vector P or matrix P×T/T×P.")
+      stopifnot(all(is.finite(sigma_fixed_PT)), all(sigma_fixed_PT > 0))
+    }
+    sigma_fixed_PT <- pmax(sigma_fixed_PT, 1e-6)
+  } else if (SIGMA_MODE == 3L) {          # scalar
+    if (is.null(sigma_input)) stop("sigma_mode='scalar' requires a scalar ln sd.")
+    stopifnot(length(sigma_input) == 1, is.finite(sigma_input), sigma_input > 0)
+    sigma_scalar <- as.numeric(sigma_input)
+  }
+
+  USE_EST_BETA <- as.integer(estimate_beta)
+  if (!estimate_beta) {
+    if (is.null(beta_fixed)) stop("If estimate_beta=FALSE, provide beta_fixed (vector P).")
+    stopifnot(length(beta_fixed) == P, all(beta_fixed > 0), all(is.finite(beta_fixed)))
+  }
+
+  # ---------------------
+  # NIMBLE model code
+  # ---------------------
+  code <- nimble::nimbleCode({
+    for (p in 1:P) {                                                   # loop plants
+      k[p]         ~ T(dlnorm(log(8), 1), 0.5, 20)                     # scaling for softplus
+      sigma_eps[p] ~ T(dlnorm(log(0.5), 0.5), 0, Inf)                      # RW step sd for z
+      z[p,1] ~ dnorm(1, sd = sigma_eps[p])                             # init latent driver
+      for (t in 2:T) { z[p,t] ~ dnorm(z[p,t-1], sd = sigma_eps[p]) }   # Gaussian RW in time
+      for (t in 1:T) { Rt[p,t] <- softplus_stable(k[p] * z[p,t]) / k[p] } # positive Rt via softplus
+
+      It[p,1] ~ dpois(61)                                             # weakly-informative start
+      for (t in 2:T) {                                                 # renewal infections
+        iota[p,t] <- Rt[p,t] * convSum(t, It[p,1:(t-1)], G, g[1:G])    # lambda_t = Rt * (g * I)
+        It[p,t]   ~ dpois(iota[p,t])                                   # infections at time t
+      }
+
+      if (USE_EST_BETA == 1) {                                         # scale to observations
+        log_beta[p] ~ dnorm(0, sd = 2)                                 # log-normal prior
+        beta[p]     <- exp(log_beta[p])
+      } else {
+        beta[p] <- beta_fixed[p]
+      }
+
+      if (SIGMA_MODE == 1) {                                           # per-plant ln sd
+        sigma_obs_pl[p] ~ T(dnorm(0.5, sd = 0.5), 0.05, 3)
+      } else if (SIGMA_MODE == 2) {                                    # time-varying ln sd
+        log_sigma[p,1] ~ dnorm(rw_logsigma0, sd = 0.5)
+        sigma_sigmarw[p] ~ T(dnorm(0, sd = rw_sd_init), 0.01, 2)
+        for (t in 2:T) { log_sigma[p,t] ~ dnorm(log_sigma[p,t-1], sd = sigma_sigmarw[p]) }
+        for (t in 1:T) { sigma_obs_tv[p,t] <- exp(log_sigma[p,t]) }
+      }
+
+      for (t in 1:T) {                                                 # observation model
+        psi[p,t] <- beta[p] * convSum0(t, It[p,1:t], D, d[1:D])        # expected signal
+        if (SIGMA_MODE == 0) {
+          mu_obs[p,t] <- log(psi[p,t] + 1e-6) - 0.5 * (sigma_obs[p,t]^2) # fixed ln sd
+          y[p,t] ~ dlnorm(mu_obs[p,t], sdlog = sigma_obs[p,t])
+        } else if (SIGMA_MODE == 1) {
+          mu_obs[p,t] <- log(psi[p,t] + 1e-6) - 0.5 * (sigma_obs_pl[p]^2) # plant ln sd
+          y[p,t] ~ dlnorm(mu_obs[p,t], sdlog = sigma_obs_pl[p])
+        } else if (SIGMA_MODE == 2) {
+          mu_obs[p,t] <- log(psi[p,t] + 1e-6) - 0.5 * (sigma_obs_tv[p,t]^2) # tv ln sd
+          y[p,t] ~ dlnorm(mu_obs[p,t], sdlog = sigma_obs_tv[p,t])
+        } else if (SIGMA_MODE == 3) {
+          mu_obs[p,t] <- log(psi[p,t] + 1e-6) - 0.5 * (sigma_scalar^2) # scalar ln sd
+          y[p,t] ~ dlnorm(mu_obs[p,t], sdlog = sigma_scalar)
+        }
+      }
+    }
+  })
+
+  consts <- list(P=P, T=Tt, G=G, D=D,
+                 SIGMA_MODE=SIGMA_MODE, USE_EST_BETA=USE_EST_BETA,
+                 rw_logsigma0=rw_logsigma0, rw_sd_init=rw_sd_init)
+  if (SIGMA_MODE == 0L) consts$sigma_obs    <- sigma_fixed_PT
+  if (SIGMA_MODE == 3L) consts$sigma_scalar <- sigma_scalar
+  if (!estimate_beta)   consts$beta_fixed   <- as.numeric(beta_fixed)
+
+  dataList <- list(y=y_PT, g=g, d=d)
+
+  # Default inits if none provided (kept simple & stable)
+  if (is.null(nburnin)) nburnin <- floor(0.1 * iter)
+  if (is.null(inits_list)) {
+    inits_list <- list(
+      It        = matrix(1, nrow=P, ncol=Tt),
+      z         = matrix(1, nrow=P, ncol=Tt),
+      k         = rep(8, P),
+      sigma_eps = rep(2, P)
+    )
+    if (estimate_beta) inits_list$log_beta <- rep(0, P)
+    if (SIGMA_MODE == 1L) {
+      inits_list$sigma_obs_pl <- rep(0.7, P)
+    } else if (SIGMA_MODE == 2L) {
+      inits_list$log_sigma     <- matrix(rw_logsigma0, nrow=P, ncol=Tt)
+      inits_list$sigma_sigmarw <- rep(0.1, P)
+    }
+  }
+
+  # Compile + MCMC
+  model  <- nimble::nimbleModel(code, constants=consts, data=dataList, inits=inits_list, check=TRUE)
+  cmodel <- nimble::compileNimble(model)
+
+  monitors_main <- c("k","sigma_eps","It")
+  monitors_aux  <- c("Rt")
+  if (estimate_beta) monitors_aux <- c(monitors_aux, "beta")
+  if (SIGMA_MODE == 1L) monitors_aux <- c(monitors_aux, "sigma_obs_pl")
+  if (SIGMA_MODE == 2L) monitors_aux <- c(monitors_aux, "sigma_obs_tv","sigma_sigmarw")
+
+  conf  <- nimble::configureMCMC(cmodel, monitors=monitors_main, monitors2=monitors_aux,
+                                 useConjugacy=FALSE, enableWAIC=TRUE)
+  Rmcmc <- nimble::buildMCMC(conf)
+  cMcmc <- nimble::compileNimble(Rmcmc, project=model)
+
+  t0 <- Sys.time()
+  out <- nimble::runMCMC(cMcmc, niter=iter, nburnin=nburnin, thin=thin, nchains=nchains,
+                         samplesAsCodaMCMC=TRUE, summary=TRUE, WAIC=TRUE)
+  elapsed <- Sys.time() - t0
+
+  # Safe extractor for draws → array[draws,P,T]
+  .extract_any <- function(out_obj, name) {
+    pick_mat <- function(o) {
+      m2 <- try(as.matrix(o$samples2), silent=TRUE)
+      if (!inherits(m2,"try-error") && any(grepl(paste0("^",name,"\\["), colnames(m2)))) return(m2)
+      m1 <- try(as.matrix(o$samples),  silent=TRUE)
+      if (!inherits(m1,"try-error") && any(grepl(paste0("^",name,"\\["), colnames(m1)))) return(m1)
+      return(NULL)
+    }
+    M <- pick_mat(out_obj)
+    if (is.null(M)) return(NULL)
+    cols <- grep(paste0("^",name,"\\["), colnames(M), value=TRUE)
+    idx_str <- sub(paste0("^",name,"\\["), "", cols)
+    idx_str <- sub("\\]$","", idx_str)
+    split   <- strsplit(idx_str, ",\\s*")
+    pt <- do.call(rbind, lapply(split, function(v) as.integer(v)))
+    arr <- array(NA_real_, dim=c(nrow(M), P, Tt))
+    for (j in seq_along(cols)) {
+      p <- pt[j,1]; t <- pt[j,2]
+      if (p>=1 && p<=P && t>=1 && t<=Tt) arr[,p,t] <- M[, cols[j]]
+    }
+    miss <- which(is.na(arr[1,,]), arr.ind=TRUE)
+    list(arr=arr, missing=miss)
+  }
+
+  # Posterior mean ln-sd per (p,t) for convenience
+  sigma_post_mean_PT <- NULL
+  missing_sigma_idx  <- NULL
+  if (SIGMA_MODE == 0L) {
+    sigma_post_mean_PT <- sigma_fixed_PT
+  } else if (SIGMA_MODE == 1L) {
+    M <- as.matrix(out$samples2)
+    cols <- grep("^sigma_obs_pl\\[", colnames(M), value=TRUE)
+    post_pl <- colMeans(M[, cols, drop=FALSE])
+    sigma_post_mean_PT <- matrix(as.numeric(post_pl), nrow=P, ncol=Tt)
+  } else if (SIGMA_MODE == 2L) {
+    ext <- .extract_any(out, "sigma_obs_tv")
+    if (is.null(ext)) {
+      ext <- .extract_any(out, "log_sigma")
+      if (!is.null(ext)) {
+        sigma_post_mean_PT <- apply(exp(ext$arr), c(2,3), mean, na.rm=TRUE)
+        missing_sigma_idx  <- ext$missing
+      }
+    } else {
+      sigma_post_mean_PT <- apply(ext$arr, c(2,3), mean, na.rm=TRUE)
+      missing_sigma_idx  <- ext$missing
+    }
+  } else if (SIGMA_MODE == 3L) {
+    sigma_post_mean_PT <- matrix(consts$sigma_scalar, nrow=P, ncol=Tt)
+  }
+
+  list(
+    mcmc            = out,
+    elapsed         = elapsed,
+    elapsed_seconds = as.numeric(elapsed, units="secs"),
+    y_PT            = y_PT,
+    kernels         = list(g=g, d=d),
+    sigma_mode      = sigma_mode,
+    sigma_fixed_PT  = if (SIGMA_MODE==0L) sigma_fixed_PT else NULL,
+    sigma_scalar    = if (SIGMA_MODE==3L) sigma_scalar else NULL,
+    sigma_post_mean_PT = sigma_post_mean_PT,
+    missing_sigma_idx  = missing_sigma_idx,
+    extract_array      = function(name) .extract_any(out, name)$arr
+  )
+}
+```
+
+```{r}
+# ------------------------------------------------------------
+# 11) Example runs (A: raw CPD_b, B: filtered means, C: filtered + fixed sigma)
+# ------------------------------------------------------------
+y_kf <- y_kf_cpd_TxP_b
+
+fitA_cpd <- fit_rsv_renewal_nimble(
+  y = mat_rsv_cpd_b,
+  y_is_T_by_P = TRUE,
+  sigma_mode = "plant",
+  iter = 30000, nchains = 4
+)
+
+
+sigma_ln <- matrix(sigma_ln, nrow = P, ncol = Tt)  # asegurar P×T
+
+fitB_cpd <- fit_rsv_renewal_nimble(
+  y = y_kf,
+  y_is_T_by_P = TRUE,
+  sigma_mode = "fixed",
+  sigma_input = sigma_ln,
+  iter = 30000, nchains = 4
+)
+
+
+fitA_cpl <- fit_rsv_renewal_nimble(
+  y = mat_rsv_cpl,
+  y_is_T_by_P = TRUE,
+  sigma_mode = "plant",
+  iter = 30000, nchains = 4
+)
+
+fitB_cpl <- fit_rsv_renewal_nimble(
+  y = y_kf_cpl_TxP,
+  y_is_T_by_P = TRUE,
+  sigma_mode = "fixed",
+  sigma_input = sdlog_TxP_cpl,
+  iter = 30000, nchains = 4
+)
+```
+
+```{r}
+idx_df <- tibble(var = rownames(fitB_cpd$mcmc$summary$all.chains)) %>%
+  dplyr::filter(grepl("^It\\[", var)) %>%
+  dplyr::mutate(var_clean = sub("^It\\[|\\]$", "", var)) %>%  # quita It[ y ]
+  tidyr::separate(var_clean, into = c("p","t"), sep = ",", remove = TRUE) %>%
+  dplyr::mutate(
+    p = as.integer(p),
+    t = as.integer(gsub("\\D", "", t))  # <- elimina el ']' (y cualquier no dígito)
+  )
+
+map_t_date <- tibble(t = seq_along(dates_rsv), Date = dates_rsv)
+map_p_wwtp <- tibble(p = seq_along(plants_order), WWTP = plants_order)
+
+missing_tbl <- ww_rsv %>%
+  dplyr::select(WWTP, Date, Missing) %>%
+  dplyr::distinct()
+
+It_B_cpd <- fitB_cpd$mcmc$summary$all.chains %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("var") %>%
+  dplyr::inner_join(idx_df, by = "var") %>%
+  dplyr::select(var, p, t, Mean, Median, `St.Dev.`, `95%CI_low`, `95%CI_upp`) %>%
+  dplyr::left_join(map_t_date, by = "t") %>%
+  dplyr::left_join(map_p_wwtp, by = "p") %>%
+  dplyr::left_join(missing_tbl, by = c("WWTP","Date"))
+
+# sdlog (ln) por (t,p)
+It_B_cpd$sigma_ssm <- sdlog_TxP[cbind(It_B_cpd$t, It_B_cpd$p)]
+
+It_B_cpd <- It_B_cpd %>%
+  dplyr::rename(
+    posterior_mean_It   = Mean,
+    posterior_median_It = Median,
+    posterior_sd_It     = `St.Dev.`,
+    ci95_low            = `95%CI_low`,
+    ci95_upp            = `95%CI_upp`
+  ) %>%
+  dplyr::arrange(WWTP, Date)
+# Guardar resultado en CSV carpeta thesis project
+write.csv(It_B_cpd, "ThesisProject/It_FitB_BCPD.csv", row.names = FALSE)
+
+plot(It_B_cpd$Date, It_B_cpd$sigma_ssm, type='l', log='y')
+# Haz plot los missing points
+missing_points <- It_B_cpd %>% dplyr::filter(Missing == TRUE)
+points(missing_points$Date, missing_points$sigma_ssm, col='red', pch=19)
+```
+
+```{r}
+# ============================
+# Summary mean, median, SD, 95% CI (A, B, C)
+# ============================
+key_A_cpd <- fitA_cpd$mcmc$summary$all.chains %>%
+  as.data.frame() %>%
+  dplyr::filter(grepl("^(k|sigma_eps|beta|sigma_obs_pl\\[)", rownames(.))) %>%
+  dplyr::select("Mean","Median","St.Dev.","95%CI_low","95%CI_upp") %>%
+  round(3)
+
+key_B_cpd <- fitB_cpd$mcmc$summary$all.chains %>%
+  as.data.frame() %>%
+  dplyr::filter(grepl("^(k|sigma_eps|beta|sigma_obs_pl\\[)", rownames(.))) %>%
+  dplyr::select("Mean","Median","St.Dev.","95%CI_low","95%CI_upp") %>%
+  round(3)
+
+key_A_cpl <- fitA_cpl$mcmc$summary$all.chains %>%
+  as.data.frame() %>%
+  dplyr::filter(grepl("^(k|sigma_eps|beta|sigma_obs_pl\\[)", rownames(.))) %>%
+  dplyr::select("Mean","Median","St.Dev.","95%CI_low","95%CI_upp") %>%
+  round(3)
+
+key_B_cpl <- fitB_cpl$mcmc$summary$all.chains %>%
+  as.data.frame() %>%
+  dplyr::filter(grepl("^(k|sigma_eps|beta|sigma_obs_pl\\[)", rownames(.))) %>%
+  dplyr::select("Mean","Median","St.Dev.","95%CI_low","95%CI_upp") %>%
+  round(3)
+
+# Etiquetas
+key_A_cpd <- cbind(Model="A (BCPD, σ̂_y bayes)", key_A_cpd)
+key_B_cpd <- cbind(Model="B (FE, P̂_t)", key_B_cpd)
+
+key_A_cpl <- cbind(Model="A (CPL, σ̂_y bayes)", key_A_cpl)
+key_B_cpl <- cbind(Model="B (FE, P̂_t)", key_B_cpl)
+
+# Renombrar filas para presentación
+rownames(key_A_cpd) <- c("k","sigma_eps","beta","sigma_bayes")
+rownames(key_B_cpd) <- c("k","sigma_eps","beta")
+
+rownames(key_A_cpl) <- c("k","sigma_eps","beta","sigma_bayes")
+rownames(key_B_cpl) <- c("k","sigma_eps","beta")
+
+# Llevar rownames a columna
+key_A_cpd <- cbind(Parameter=rownames(key_A_cpd), key_A_cpd); rownames(key_A_cpd) <- NULL
+key_B_cpd <- cbind(Parameter=rownames(key_B_cpd), key_B_cpd); rownames(key_B_cpd) <- NULL
+
+key_A_cpl <- cbind(Parameter=rownames(key_A_cpl), key_A_cpl); rownames(key_A_cpl) <- NULL
+key_B_cpl <- cbind(Parameter=rownames(key_B_cpl), key_B_cpl); rownames(key_B_cpl) <- NULL
+
+key_params_all_cpd <- rbind(key_A_cpd, key_B_cpd)
+key_params_all_cpl <- rbind(key_A_cpl, key_B_cpl)
+print(key_params_all_cpd)
+print(key_params_all_cpl)
+```
+
+```{r}
+# ============================================================
+# Convergence summary by families (Rt, It, beta, sigma_eps, k, [sigma_obs_pl])
+#   - MPSRF (multivariate R-hat) per family when p>1 and >=2 chains
+#   - Rhat_max (max univariate R-hat) per family when >=2 chains
+#   - relMCSE for scalar families = (sd/sqrt(ESS)) / |mean|
+#     * ESS via coda::effectiveSize en cadenas combinadas
+#     * Si mean ~ 0, dividimos por 'tiny' para evitar infs
+# ============================================================
+gr_table_from_mcmc_ultra <- function(
+  mcmc_container,
+  prefer_samples2_for = c("Rt","beta","sigma_obs_pl"),
+  include_sigma_obs_pl = FALSE,
+  drop_t1_for_It = TRUE,
+  thr_rhat = 1.10,
+  ridge = 1e-8,
+  quiet = TRUE,
+  tiny = 1e-8
+){
+  `%||%` <- function(x, y) if (is.null(x)) y else x
+
+  as_chain_mats <- function(obj) {
+    if (is.null(obj)) return(NULL)
+    if (inherits(obj, "mcmc"))      return(list(as.matrix(obj)))
+    if (inherits(obj, "mcmc.list")) return(lapply(obj, function(ch) as.matrix(ch)))
+    NULL
+  }
+
+  align_chains <- function(mats, quiet = TRUE) {
+    if (is.null(mats) || !length(mats)) return(NULL)
+    cols_list <- lapply(mats, colnames)
+    common <- Reduce(intersect, cols_list)
+    if (!length(common)) {
+      if (!quiet) message("No common variables; returning 0-col matrices.")
+      n_vec <- sapply(mats, nrow)
+      return(lapply(n_vec, function(nr) matrix(numeric(0), nrow = nr, ncol = 0,
+                                               dimnames = list(NULL, character(0)))))
+    }
+    ref  <- colnames(mats[[1]])
+    ord  <- order(match(common, ref))
+    keep <- common[ord]
+    nmin <- min(sapply(mats, nrow))
+    lapply(mats, function(M) {
+      M2 <- M[seq_len(nmin), keep, drop = FALSE]
+      storage.mode(M2) <- "double"
+      M2
+    })
+  }
+
+  subset_by_pattern <- function(mats, pattern) {
+    if (is.null(mats)) return(NULL)
+    lapply(mats, function(M) {
+      if (!ncol(M)) return(M[, 0, drop = FALSE])
+      idx <- grep(pattern, colnames(M))
+      if (!length(idx)) return(M[, 0, drop = FALSE])
+      M[, idx, drop = FALSE]
+    })
+  }
+
+  drop_time1_cols <- function(mats, var_prefix = "It") {
+    if (is.null(mats)) return(NULL)
+    pat_t1 <- paste0("^", var_prefix, "\\[\\s*\\d+\\s*,\\s*1\\s*\\]$")
+    lapply(mats, function(M) {
+      if (!ncol(M)) return(M)
+      keep <- which(!grepl(pat_t1, colnames(M)))
+      if (!length(keep)) return(M[, 0, drop = FALSE])
+      M[, keep, drop = FALSE]
+    })
+  }
+
+  has_vars  <- function(mats) !is.null(mats) && length(mats) > 0 && ncol(mats[[1]]) > 0
+  n_chains  <- function(mats) if (is.null(mats)) 0L else length(mats)
+
+  rhat_univar <- function(mats) {
+    m <- length(mats); if (m < 2L) return(rep(NA_real_, ncol(mats[[1]])))
+    n <- nrow(mats[[1]]); if (n < 2L) return(rep(NA_real_, ncol(mats[[1]])))
+    p <- ncol(mats[[1]])
+    means <- sapply(mats, colMeans); if (!is.matrix(means)) means <- matrix(means, nrow = p)
+    overall <- rowMeans(means)
+    s2j <- sapply(mats, function(M) apply(M, 2, stats::var)); if (!is.matrix(s2j)) s2j <- matrix(s2j, nrow = p)
+    W <- rowMeans(s2j)
+    B <- n/(m - 1) * rowSums((means - overall)^2)
+    Vhat <- ((n - 1)/n) * W + B/n
+    Rhat <- sqrt(Vhat / W)
+    bad  <- !is.finite(Rhat) | W <= 0
+    if (any(bad)) {
+      Rhat[bad & W == 0 & B == 0] <- 1
+      Rhat[bad & !(W == 0 & B == 0)] <- NA_real_
+    }
+    as.numeric(Rhat)
+  }
+
+  mpsrf <- function(mats, ridge = 1e-8) {
+    m <- length(mats); if (m < 2L) return(NA_real_)
+    n <- nrow(mats[[1]]); if (n < 2L) return(NA_real_)
+    p <- ncol(mats[[1]]); if (p == 0L) return(NA_real_)
+    if (p == 1L) return(suppressWarnings(max(rhat_univar(mats), na.rm = TRUE)))
+    S_list <- lapply(mats, function(M) if (nrow(M) < 2L) matrix(0, ncol(M), ncol(M)) else stats::cov(M))
+    W <- Reduce("+", S_list) / m
+    mu_mat <- do.call(cbind, lapply(mats, colMeans))
+    mu_bar <- rowMeans(mu_mat)
+    Cmu <- mu_mat - mu_bar
+    B <- (n/(m - 1)) * (Cmu %*% t(Cmu))
+    Vhat <- ((n - 1)/n) * W + (1/n) * B
+    Wr <- W + diag(ridge * max(1e-12, mean(diag(W))), nrow(W))
+    ev <- try(base::eigen(solve(Wr, Vhat), only.values = TRUE)$values, silent = TRUE)
+    if (inherits(ev, "try-error")) return(NA_real_)
+    sqrt(max(Re(ev), na.rm = TRUE))
+  }
+
+  # ---------- MCSE helpers (scalar only) ----------
+  rel_mcse_scalar <- function(mats, tiny = 1e-8) {
+    # Combina cadenas a mcmc.list y usa coda::effectiveSize
+    stopifnot(requireNamespace("coda", quietly = TRUE))
+    if (is.null(mats) || !length(mats)) return(NA_real_)
+    # si hay >1 columnas, no es escalar -> NA
+    if (ncol(mats[[1]]) != 1L) return(NA_real_)
+    # construir mcmc.list
+    mlist <- coda::mcmc.list(lapply(mats, coda::mcmc))
+    x_all <- as.numeric(do.call(rbind, lapply(mats, as.matrix))[, 1])
+    mu    <- mean(x_all)
+    sdall <- stats::sd(x_all)
+    ess   <- as.numeric(coda::effectiveSize(mlist))
+    if (!is.finite(ess) || ess <= 0) return(NA_real_)
+    mcse  <- sdall / sqrt(ess)
+    rel   <- mcse / max(abs(mu), tiny)
+    as.numeric(rel)
+  }
+
+  # Detect & align sources
+  samples  <- NULL
+  samples2 <- NULL
+  if (inherits(mcmc_container, "mcmc.list") || inherits(mcmc_container, "mcmc")) {
+    samples <- mcmc_container
+  } else if (is.list(mcmc_container) && (!is.null(mcmc_container$samples) || !is.null(mcmc_container$samples2))) {
+    samples  <- mcmc_container$samples
+    samples2 <- mcmc_container$samples2
+  } else {
+    stop("Unrecognized object: pass fit$mcmc or an mcmc.list.")
+  }
+
+  mats1 <- align_chains(as_chain_mats(samples),  quiet = quiet)
+  mats2 <- align_chains(as_chain_mats(samples2), quiet = quiet)
+
+  # Patterns (families)
+  pat <- list(
+    Rt        = "^Rt\\[",
+    It        = "^It\\[",
+    beta      = "^beta(\\[|$)",
+    sigma_eps = "^sigma_eps(\\[|$)",
+    k         = "^k(\\[|$)"
+  )
+  if (isTRUE(include_sigma_obs_pl)) pat$sigma_obs_pl <- "^sigma_obs_pl(\\[|$)"
+
+  choose_source <- function(fam) if (fam %in% prefer_samples2_for) mats2 %||% mats1 else mats1
+
+  fam_stats <- purrr::imap(pat, function(regex, fam) {
+    base <- choose_source(fam)
+    if (is.null(base)) return(list(mpsrf = NA_real_, rhat_max = NA_real_, relMCSE = NA_real_))
+
+    sub <- subset_by_pattern(base, regex)
+    if (fam == "It" && isTRUE(drop_t1_for_It)) sub <- drop_time1_cols(sub, "It")
+    if (!has_vars(sub) || n_chains(sub) < 2L) return(list(mpsrf = NA_real_, rhat_max = NA_real_, relMCSE = NA_real_))
+
+    rvec <- rhat_univar(sub)
+    rmax <- suppressWarnings(max(rvec, na.rm = TRUE)); if (!is.finite(rmax)) rmax <- NA_real_
+    mps  <- mpsrf(sub, ridge = ridge)
+
+    # relMCSE sólo si la familia es escalar (exactamente 1 columna)
+    rel  <- tryCatch(rel_mcse_scalar(sub, tiny = tiny), error = function(e) NA_real_)
+
+    list(mpsrf = mps, rhat_max = rmax, relMCSE = rel)
+  })
+
+  fam_order <- c("Rt","It","beta","sigma_eps","k", if (isTRUE(include_sigma_obs_pl)) "sigma_obs_pl")
+  tibble::tibble(
+    variable    = fam_order,
+    Rhat_multi  = purrr::map_dbl(variable, ~ fam_stats[[.x]]$mpsrf %||% NA_real_),
+    Rhat_max    = purrr::map_dbl(variable, ~ fam_stats[[.x]]$rhat_max %||% NA_real_),
+    relMCSE     = purrr::map_dbl(variable, ~ fam_stats[[.x]]$relMCSE %||% NA_real_)
+  ) |>
+    dplyr::mutate(
+      Rhat      = dplyr::if_else(is.finite(Rhat_multi), Rhat_multi, Rhat_max),
+      Converged = dplyr::if_else(is.finite(Rhat) & Rhat <= thr_rhat, "Yes", "No")
+    ) |>
+    dplyr::select(variable, Rhat, Rhat_multi, Rhat_max, relMCSE, Converged)
+}
+
+# ======================
+# Uso (ejemplo A–C)
+# ======================
+gr_list <- list(
+  A = gr_table_from_mcmc_ultra(fitA_cpd$mcmc, include_sigma_obs_pl = TRUE),
+  B = gr_table_from_mcmc_ultra(fitB_cpd$mcmc, include_sigma_obs_pl = FALSE)
+)
+
+gr_all <- dplyr::bind_rows(
+  purrr::imap(gr_list, ~ dplyr::mutate(.x, Model = .y))
+) |>
+  dplyr::mutate(
+    Model = dplyr::recode(Model,
+      A = "BCPD, σ_y (bayes)",
+      B = "FE, P̂_t"
+    )
+  ) |>
+  dplyr::mutate(dplyr::across(c(Rhat, Rhat_multi, Rhat_max, relMCSE), ~ round(.x, 3))) |>
+  dplyr::select(Model, variable, Rhat, Rhat_multi, Rhat_max, relMCSE, Converged) |>
+  dplyr::filter(!is.na(Rhat))
+
+print(gr_all)
+```
+
+```{r, warning=FALSE}
+# ============================================================
+# It/Rt vs Viral Load (p. ej., B gc/day)
+# ============================================================
+
+ci_tbl_from_summary <- function(fit, var = c("It","Rt"), dates, plant_names) {
+  var <- match.arg(var)
+  stopifnot(!is.null(fit$mcmc$summary$all.chains))
+
+  summ <- fit$mcmc$summary$all.chains %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("par")
+
+  summ <- summ %>%
+    dplyr::filter(grepl(paste0("^", var, "\\["), par)) %>%
+    dplyr::mutate(
+      idx = sub(paste0("^", var, "\\["), "", par),
+      idx = sub("\\]$", "", idx)
+    ) %>%
+    tidyr::separate(idx, into = c("p","t"), sep = ",\\s*", remove = TRUE) %>%
+    dplyr::mutate(
+      p = as.integer(p),
+      t = as.integer(gsub("\\D", "", t))
+    )
+
+  # chequeos
+  P  <- length(plant_names)
+  Tt <- length(dates)
+  stopifnot(all(summ$p >= 1 & summ$p <= P), all(summ$t >= 1 & summ$t <= Tt))
+
+  # arma tabla long en el mismo formato que tu plot usa
+  out <- summ %>%
+    dplyr::transmute(
+      WWTP = plant_names[p],
+      Date = dates[t],
+      mean = Mean,
+      lwr  = `95%CI_low`,
+      upr  = `95%CI_upp`,
+      var  = var
+    ) %>%
+    dplyr::arrange(WWTP, Date)
+
+  out
+}
+
+plot_ItRt_vs_conc_paper <- function(
+  fit,
+  y,
+  dates,
+  plant_names = NULL,
+  y_is_T_by_P = TRUE,
+  facet_ncol = 1,
+  y_missing_ref = NULL,
+  facet_scales = c("free_y","fixed"),
+  axis_right_label = "Viral Load (B gc/day)",
+  use_summary_ci = TRUE,     # <--- NUEVO: usa 95%CI_low/upp del summary
+  tbl_it = NULL,             # <--- opcional: si ya lo tienes armado
+  tbl_rt = NULL              # <--- opcional: si ya lo tienes armado
+){
+  facet_scales <- match.arg(facet_scales)
+
+  suppressPackageStartupMessages({
+    library(dplyr); library(tidyr); library(ggplot2)
+  })
+
+  `%||%` <- function(x, y) if (is.null(x)) y else x
+
+  # ---------- helpers ----------
+  as_PT <- function(m, tp = TRUE){ m <- as.matrix(m); if (tp) t(m) else m }
+  q2 <- function(x, p = c(.05, .95)) stats::quantile(x[is.finite(x)], probs = p, na.rm = TRUE)
+
+  # ---------- shape & names ----------
+  y_PT <- as_PT(y, y_is_T_by_P)
+  P <- nrow(y_PT); Tt <- ncol(y_PT)
+  stopifnot(length(dates) == Tt)
+  if (is.null(plant_names)) plant_names <- paste0("P", seq_len(P))
+
+  # ---------- base de missing ----------
+  y_miss_ref <- y_missing_ref %||% y
+  y_miss_PT  <- as_PT(y_miss_ref, y_is_T_by_P)
+  stopifnot(nrow(y_miss_PT) == P, ncol(y_miss_PT) == Tt)
+
+  # Sombras por rachas de NA
+  step_days <- {
+    dd <- diff(as.Date(dates))
+    sd <- suppressWarnings(as.numeric(stats::median(dd)))
+    if (!is.finite(sd) || sd <= 0) 1 else sd
+  }
+  make_bands_for_p <- function(p){
+    miss <- is.na(y_miss_PT[p, ])
+    if (!any(miss)) return(NULL)
+    rl <- rle(miss)
+    ends <- cumsum(rl$lengths)
+    starts <- ends - rl$lengths + 1
+    runs <- tibble::tibble(start = starts[rl$values], end = ends[rl$values])
+    if (!nrow(runs)) return(NULL)
+    tibble::tibble(
+      WWTP = plant_names[p],
+      xmin = as.Date(dates[runs$start]) - step_days/2,
+      xmax = as.Date(dates[runs$end])   + step_days/2,
+      ymin = -Inf, ymax = Inf
+    )
+  }
+  bands_df <- dplyr::bind_rows(lapply(seq_len(P), make_bands_for_p))
+
+  # ---------- It / Rt summary tables ----------
+  if (isTRUE(use_summary_ci)) {
+    if (is.null(tbl_it)) tbl_it <- ci_tbl_from_summary(fit, "It", dates, plant_names)
+    if (is.null(tbl_rt)) tbl_rt <- ci_tbl_from_summary(fit, "Rt", dates, plant_names)
+  } else {
+    stop("Si use_summary_ci=FALSE, entonces necesitas pasar tbl_it y tbl_rt ya armadas.")
+  }
+
+  # ---------- overlay (concentración / carga viral) en long ----------
+  conc_tbl <- tibble::as_tibble(t(y_PT), .name_repair = "minimal")
+  names(conc_tbl) <- plant_names
+  conc_tbl <- conc_tbl %>%
+    dplyr::mutate(Date = dates) %>%
+    tidyr::pivot_longer(-Date, names_to = "WWTP", values_to = "conc_val")
+
+  # ---------- mapeos (a,b)
+  map_global <- (function(){
+    # Rt: usa rango (mean) para escalar el overlay
+    r_q  <- q2(tbl_rt$mean, c(.05, .95))
+    c_qR <- q2(conc_tbl$conc_val, c(.00, .95))
+    a_R  <- if (diff(c_qR) > 0) (r_q[2] - 0) / (c_qR[2] - 0) else 1
+    b_R  <- 0
+
+    # It
+    i_q  <- q2(tbl_it$mean, c(.05, .95))
+    c_qI <- q2(conc_tbl$conc_val, c(.00, .95))
+    a_I  <- if (diff(c_qI) > 0) (i_q[2] - i_q[1]) / (c_qI[2] - c_qI[1]) else 1
+    b_I  <- i_q[1] - a_I * c_qI[1]
+    list(a_R=a_R,b_R=b_R,a_I=a_I,b_I=b_I)
+  })()
+
+  calc_map_one <- function(df_left, df_right, plant){
+    li <- df_left  |> dplyr::filter(WWTP == plant) |> dplyr::pull(mean)
+    ri <- df_right |> dplyr::filter(WWTP == plant) |> dplyr::pull(conc_val)
+    r_q <- stats::quantile(li[is.finite(li)], probs = c(.05,.95), na.rm = TRUE)
+    c_q <- stats::quantile(ri[is.finite(ri)], probs = c(.00,.95), na.rm = TRUE)
+    a   <- if ((c_q[2]-c_q[1]) > 0) (r_q[2]-r_q[1])/(c_q[2]-c_q[1]) else 1
+    b   <- r_q[1] - a*c_q[1]
+    list(a=a,b=b)
+  }
+  maps_by_plant <- setNames(lapply(plant_names, \(p) calc_map_one(tbl_it, conc_tbl, p)), plant_names)
+
+  conc_for_R <- conc_tbl
+  conc_for_I <- conc_tbl
+
+  if (facet_scales == "free_y" && P > 1) {
+    conc_for_R <- conc_for_R |>
+      dplyr::group_by(WWTP) |>
+      dplyr::mutate(y_overlay = maps_by_plant[[WWTP[1]]]$a * conc_val + 0) |>
+      dplyr::ungroup()
+
+    conc_for_I <- conc_for_I |>
+      dplyr::group_by(WWTP) |>
+      dplyr::mutate(y_overlay = maps_by_plant[[WWTP[1]]]$a * conc_val + maps_by_plant[[WWTP[1]]]$b) |>
+      dplyr::ungroup()
+
+    sec_map <- if (P == 1) {
+      list(
+        a_I = maps_by_plant[[plant_names]]$a, b_I = maps_by_plant[[plant_names]]$b,
+        a_R = maps_by_plant[[plant_names]]$a, b_R = 0
+      )
+    } else map_global
+  } else {
+    conc_for_R <- conc_for_R %>% mutate(y_overlay = map_global$a_R * conc_val + map_global$b_R)
+    conc_for_I <- conc_for_I %>% mutate(y_overlay = map_global$a_I * conc_val + map_global$b_I)
+    sec_map    <- map_global
+  }
+
+  # ---------- theme ----------
+  base_theme <- theme_classic(base_size = 12) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none",
+      panel.grid = element_blank()
+    )
+
+  # ---------- Rt plot (ribbon usa 95% CI del summary) ----------
+  p_rt <- ggplot() +
+    { if (nrow(bands_df)) geom_rect(data = bands_df,
+                                   aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                                   inherit.aes = FALSE, fill = "grey85", alpha = 0.35) } +
+    geom_ribbon(data = tbl_rt, aes(Date, ymin = lwr, ymax = upr),
+                fill = "orange", alpha = 0.25) +
+    geom_line(data = tbl_rt, aes(Date, mean),
+              linewidth = 1.0, color = "orange4") +
+    geom_line(data = conc_for_R, aes(Date, y_overlay),
+              linewidth = 0.7, color = "grey30") +
+    geom_hline(yintercept = 1, color = "black", linewidth = 0.8) +
+    facet_wrap(~ WWTP, ncol = facet_ncol, scales = facet_scales) +
+    scale_y_continuous(
+      name = expression(R[t]),
+      limits = c(0, NA),
+      sec.axis = sec_axis(~ . / sec_map$a_R, name = axis_right_label)
+    ) +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b %Y", expand = c(0.01, 0.01)) +
+    labs(title = expression(R[t] ~ "vs Viral Load")) +
+    xlab("Date") + base_theme
+
+  # ---------- It plot (ribbon usa 95% CI del summary) ----------
+  ymin_it <- min(tbl_it$lwr, na.rm = TRUE)
+  p_it <- ggplot() +
+    { if (nrow(bands_df)) geom_rect(data = bands_df,
+                                   aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                                   inherit.aes = FALSE, fill = "grey85", alpha = 0.35) } +
+    geom_ribbon(data = tbl_it, aes(Date, ymin = lwr, ymax = upr),
+                fill = "#5DA5DA", alpha = 0.25) +
+    geom_line(data = tbl_it, aes(Date, mean),
+              linewidth = 1.0, color = "#2B6CB0") +
+    geom_line(data = conc_for_I, aes(Date, y_overlay),
+              linewidth = 0.7, color = "grey30") +
+    facet_wrap(~ WWTP, ncol = facet_ncol, scales = facet_scales) +
+    scale_y_continuous(
+      name = expression(I[t]),
+      limits = c(min(sec_map$b_I, ymin_it), NA),
+      sec.axis = sec_axis(~ (.-sec_map$b_I)/sec_map$a_I, name = axis_right_label),
+      expand = expansion(mult = c(0, .05))
+    ) +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b %Y", expand = c(0.01, 0.01)) +
+    labs(title = expression(I[t] ~ "vs Viral Load")) +
+    xlab("Date") + base_theme
+
+  list(
+    p_rt = p_rt, p_it = p_it,
+    tbl_rt = tbl_rt, tbl_it = tbl_it,
+    map_global = map_global, maps_by_plant = maps_by_plant,
+    bands = bands_df
+  )
+}
+
+
+# ============================================================
+# Ejemplo de uso (ajusta objetos a los tuyos)
+# ============================================================
+# Datos ya construidos arriba en tu script:
+y_obs   <- as.matrix(mat_rsv_cpd_b)     # T×P, B gc/day (o lo que estés ploteando)
+dates   <- dates_rsv
+plants  <- WWTP_focus
+
+# 1) Si quieres facetas con escalas libres (overlay mapeado por planta; sec_axis orientativo con >1 planta):
+rA <- plot_ItRt_vs_conc_paper(
+  fitA_cpd, y_obs, dates, plants,
+  y_is_T_by_P = TRUE,
+  y_missing_ref = y_obs,
+  facet_scales = "free_y",
+  axis_right_label = "Viral Load (gc/day)",
+  use_summary_ci = TRUE
+)
+
+rB <- plot_ItRt_vs_conc_paper(
+  fitB_cpd, y_kf, dates, plants,
+  y_is_T_by_P = TRUE,
+  y_missing_ref = y_obs,
+  facet_scales = "free_y",
+  axis_right_label = "Filter Estimates",
+  use_summary_ci = TRUE
+)
+
+
+Rt_A <- rA$p_rt + labs(title = expression("Viral Load Measurements with " ~ hat(sigma))) + plot_annotation(tag_levels = 'A')
+Rt_B <- rB$p_rt + labs(title = expression("Filter Estimates with " ~ hat(P)[t])) + plot_annotation(tag_levels = 'B') 
+
+It_A <- rA$p_it + labs(title = expression("Viral Load Measurements with " ~ hat(sigma))) + plot_annotation(tag_levels = 'A')
+It_B <- rB$p_it + labs(title = expression("Filter Estimates with " ~ hat(P)[t])) + plot_annotation(tag_levels = 'B')
+
+panel_rt <- (Rt_A) / (Rt_B)
+
+panel_rt <- panel_rt +
+  plot_layout(ncol = 1, guides = "collect") +
+  plot_annotation(tag_levels = "A")  # añade etiquetas A, B
+
+panel_it <- (It_A) / (It_B)
+panel_it <- panel_it +
+  plot_layout(ncol = 1, guides = "collect") +
+  plot_annotation(tag_levels = "A")  # añade etiquetas A, B
+```
+
+```{r, warning=FALSE}
+# # ============================================================
+# # WREM subtitles: data source + sigma mode, and apply to plots
+# # ============================================================
+# 
+# # ---------- 1) Variant label (use style = "subtitle" for plot subtitles) ----------
+# wrem_variant_label <- function(data_source = c("Observed","SSM"),
+#                                sigma_mode  = c("fixed","estimated"),
+#                                style = c("subtitle","legend","long","short"),
+#                                unicode = TRUE) {
+#   data_source <- match.arg(data_source)
+#   sigma_mode  <- match.arg(sigma_mode)
+#   style       <- match.arg(style)
+# 
+#   ds_long  <- if (data_source == "Observed") "Observed data" else "Kalman-filtered estimates"
+#   ds_short <- data_source
+# 
+#   if (unicode) {
+#     sig_long  <- if (sigma_mode == "fixed") "σ fixed" else "σ est."
+#     sig_short <- sig_long
+#   } else {
+#     sig_long  <- if (sigma_mode == "fixed") "sigma fixed" else "sigma est."
+#     sig_short <- sig_long
+#   }
+# 
+#   switch(style,
+#     subtitle = sprintf("%s, %s", ds_long, sig_long),
+#     legend   = sprintf("%s|%s", ds_short, ifelse(sigma_mode=="fixed","σ fixed","σ est.")),
+#     long     = sprintf("%s, %s", ds_long, sig_long),
+#     short    = sprintf("%s|%s", ds_short, ifelse(sigma_mode=="fixed","σ fixed","σ est."))
+#   )
+# }
+# 
+# # ---------- 2) Apply titles/subtitles to an rtit_vs_conc() result ----------
+# # Expects an object with p_rt, p_it, and (optionally) p_combined
+# wrem_apply_titles <- function(rtit_obj, variant_subtitle, xlab_is_date = TRUE) {
+#   stopifnot(all(c("p_rt","p_it") %in% names(rtit_obj)))
+# 
+#   add_rt <- labs(
+#     title    = expression(" " * R[t] * " vs Concentration (gc/L)"),
+#     subtitle = variant_subtitle,
+#     x        = if (xlab_is_date) "Date" else "t"
+#   )
+#   add_it <- labs(
+#     title    = expression(" " * I[t] * " vs Concentration (gc/L)"),
+#     subtitle = variant_subtitle,
+#     x        = if (xlab_is_date) "Date" else "t"
+#   )
+# 
+#   tweak <- theme(
+#     plot.title.position = "plot",
+#     plot.subtitle       = element_text(margin = margin(b = 6))
+#   )
+# 
+#   rtit_obj$p_rt <- rtit_obj$p_rt + add_rt + tweak
+#   rtit_obj$p_it <- rtit_obj$p_it + add_it + tweak
+# 
+#   if ("p_combined" %in% names(rtit_obj)) {
+#     # reconstruye el combinado para heredar los nuevos títulos/subtítulos
+#     rtit_obj$p_combined <- (rtit_obj$p_rt / plot_spacer() / rtit_obj$p_it) +
+#       plot_layout(heights = c(1, 0.08, 1))
+#   }
+#   rtit_obj
+# }
+# 
+# # ============================================================
+# # 3) Build per-fit plots, add subtitles, and make a 2×2 panel
+# #    (Assumes you already have: fitA, fitB, fitC, fitD; rtit_vs_conc();
+# #     ts_matrix_list$RSV, dates_rsv, WWTP_focus_full)
+# # ============================================================
+# 
+# # Per-fit Rt/It vs concentration
+# fit_A_plots <- rtit_vs_conc(fitA$mcmc, conc = mat_rsv_cpd, y_is_T_by_P = TRUE,
+#                             dates = dates_rsv, plant_names = WWTP_focus)
+# fit_B_plots <- rtit_vs_conc(fitB$mcmc, conc = y_kf, y_is_T_by_P = TRUE,
+#                             dates = dates_rsv, plant_names = WWTP_focus)
+# fit_C_plots <- rtit_vs_conc(fitC$mcmc, conc = y_kf, y_is_T_by_P = TRUE,
+#                             dates = dates_rsv, plant_names = WWTP_focus)
+# 
+# # Subtitles (data type + sigma mode)
+# lab_A <- wrem_variant_label("Observed","fixed",     style = "subtitle", unicode = TRUE)  # Observed data, σ fixed
+# lab_B <- wrem_variant_label("Observed","estimated", style = "subtitle", unicode = TRUE)  # Observed data, σ est.
+# lab_C <- wrem_variant_label("SSM","estimated", style = "subtitle", unicode = TRUE)  # Kalman-filtered estimates, σ est.
+# 
+# # Apply titles/subtitles
+# fit_A_plots <- wrem_apply_titles(fit_A_plots, lab_A, xlab_is_date = TRUE)
+# fit_B_plots <- wrem_apply_titles(fit_B_plots, lab_B, xlab_is_date = TRUE)
+# fit_C_plots <- wrem_apply_titles(fit_C_plots, lab_C, xlab_is_date = TRUE)
+# 
+# # 2×2 panel (Rt top rows, It bottom rows within each combined plot)
+# panel_it_2x2 <-
+#   (fit_A_plots$p_it | fit_C_plots$p_it) +
+#   plot_layout(guides = "collect", widths = c(1,1), heights = c(1,1)) &
+#   theme(plot.margin = margin(6, 12, 6, 12),
+#         text = element_text(family = "Times New Roman", size = 12))
+# 
+# # Show (with A–D tags)
+# panel_it_2x2 + plot_annotation(tag_levels = "A")
+# 
+# panel_rt_2x2 <-
+#   (fit_A_plots$p_rt | fit_C_plots$p_rt) +
+#   plot_layout(guides = "collect", widths = c(1,1), heights = c(1,1)) &
+#   theme(plot.margin = margin(6, 12, 6, 12),
+#         text = element_text(family = "Times New Roman", size = 12))
+# # Show (with A–D tags)
+# panel_rt_2x2 + plot_annotation(tag_levels = "A")
+# ```
+# 
+# ```{r}
+# # Delay entre pico de Rt/It y pico de concentración, por planta
+# peak_delay_rtit <- function(res, component = c("Rt","It")) {
+#   component <- match.arg(component)
+#   df <- if (component == "Rt") res$Rt_df else res$It_df
+#   stopifnot(all(c("Plant","Median","conc") %in% names(df)))
+# 
+#   xvar <- if ("Date" %in% names(df)) "Date" else "t"
+# 
+#   df %>%
+#     group_by(Plant) %>%
+#     # índice de fila para poder referenciar posiciones del pico
+#     mutate(.row = row_number()) %>%
+#     summarise(
+#       peak_param_row = .row[which.max(Median)],
+#       peak_param_x   = .data[[xvar]][peak_param_row],
+#       peak_param_val = Median[peak_param_row],
+# 
+#       peak_conc_row  = .row[which.max(conc)],
+#       peak_conc_x    = .data[[xvar]][peak_conc_row],
+#       peak_conc_val  = conc[peak_conc_row],
+# 
+#       delay_units = if (xvar == "Date")
+#                       as.numeric(peak_param_x - peak_conc_x)      # días
+#                     else
+#                       as.numeric(peak_param_x - peak_conc_x),     # pasos
+#       delay_weeks = if (xvar == "Date") round(delay_units/7, 2) else NA_real_,
+#       .groups = "drop"
+#     ) %>%
+#     mutate(component = component,
+#            units = if (xvar == "Date") "weeks" else "time-steps") %>%
+#     relocate(component, Plant)
+# }
+# 
+# # Asumiendo que ya tienes:
+# # fit_A_plots, fit_B_plots, fit_C_plots, fit_D_plots (devueltos por rtit_vs_conc)
+# 
+# # Rt vs conc (delay por planta)
+# delay_A_Rt <- peak_delay_rtit(fit_A_plots, "Rt") %>% mutate(model = "WREM-OBS | σ fixed")
+# delay_B_Rt <- peak_delay_rtit(fit_B_plots, "Rt") %>% mutate(model = "WREM-OBS | σ est.")
+# delay_C_Rt <- peak_delay_rtit(fit_C_plots, "Rt") %>% mutate(model = "WREM-SSM | σ est.")
+# delay_D_Rt <- peak_delay_rtit(fit_D_plots, "Rt") %>% mutate(model = "WREM-SSM | σ fixed")
+# 
+# delay_Rt_all <- bind_rows(delay_A_Rt, delay_B_Rt, delay_C_Rt, delay_D_Rt) %>%
+#   select(model, component, Plant,
+#          peak_param_x, peak_param_val, peak_conc_x, peak_conc_val,
+#          delay_units, delay_weeks, units)
+# 
+# print(delay_Rt_all)
+# 
+# # It vs conc (delay por planta)
+# delay_A_It <- peak_delay_rtit(fit_A_plots, "It") %>% mutate(model = "WREM-OBS | σ fixed")
+# delay_B_It <- peak_delay_rtit(fit_B_plots, "It") %>% mutate(model = "WREM-OBS | σ est.")
+# delay_C_It <- peak_delay_rtit(fit_C_plots, "It") %>% mutate(model = "WREM-SSM | σ est.")
+# delay_D_It <- peak_delay_rtit(fit_D_plots, "It") %>% mutate(model = "WREM-SSM | σ fixed")
+# 
+# delay_It_all <- bind_rows(delay_A_It, delay_B_It, delay_C_It, delay_D_It) %>%
+#   select(model, component, Plant,
+#          peak_param_x, peak_param_val, peak_conc_x, peak_conc_val,
+#          delay_units, delay_weeks, units)
+# 
+# print(delay_It_all)
+# 
+# 
+# # Combine 
+# 
+# delay_all <- bind_rows(delay_Rt_all, delay_It_all)
+# print(delay_all)
+```
+
+```{r}
+# ============================================================
+# Scatter plot of mean differences between models
+#   - Computes Δmean = mean(Model2) - mean(Model1) for Rt or It
+#   - Plots Δmean over time (scatter) faceted by plant
+# ============================================================
+
+# Helper: posterior mean by (p,t) as tibble
+.mean_by_pt <- function(fit, name = c("Rt","It"), dates, plant_names) {
+  name <- match.arg(name)
+  arr  <- fit$extract_array(name)             # draws × P × T
+  if (is.null(arr)) stop("No draws for ", name)
+  P <- dim(arr)[2]; Tt <- dim(arr)[3]
+
+  mu <- apply(arr, c(2,3), function(x) mean(x, na.rm = TRUE))  # P × T
+  tibble::tibble(
+    p = rep(seq_len(P), each = Tt),
+    t = rep(seq_len(Tt), times = P),
+    WWTP = rep(plant_names, each = Tt),
+    Date = rep(as.Date(dates), times = P),
+    mean = as.vector(mu)
+  )
+}
+
+# Main: build Δmean table (Model2 - Model1) and a scatter plot
+scatter_mean_diff <- function(fit1, fit2,
+                              name = c("Rt","It"),
+                              dates, plant_names,
+                              y_label = expression(Delta * " mean"),
+                              facet_ncol = 1,
+                              rope = NULL) {
+  name <- match.arg(name)
+  df1 <- .mean_by_pt(fit1, name, dates, plant_names) %>% dplyr::rename(mean1 = mean)
+  df2 <- .mean_by_pt(fit2, name, dates, plant_names) %>% dplyr::rename(mean2 = mean)
+
+  df  <- dplyr::left_join(df2, df1, by = c("p","t","WWTP","Date")) %>%
+    dplyr::mutate(delta = mean2 - mean1)
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = Date, y = delta)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5) +
+    { if (!is.null(rope) && is.finite(rope) && rope > 0)
+        ggplot2::geom_hline(yintercept = c(-rope, rope), linetype = 3, linewidth = 0.4) } +
+    ggplot2::geom_point(alpha = 0.85, size = 1.6) +
+    ggplot2::facet_wrap(~ WWTP, ncol = facet_ncol, scales = "free_y") +
+    ggplot2::scale_x_date(date_breaks = "1 month", date_labels = "%b %Y",
+                          expand = c(0.01, 0.01), guide = ggplot2::guide_axis(angle = 45)) +
+    ggplot2::labs(title = bquote(Delta~"mean"~.(name)~" (Model2 - Model1)"),
+                  x = "Date", y = y_label) +
+    ggplot2::theme_classic(base_size = 12) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
+    )
+
+  list(data = df, plot = p)
+}
+
+# ----------------------------
+# Example (adjust to your fits)
+#   Compare A vs C (Model2 - Model1 = C - A) for Rt and It
+# ----------------------------
+plants  <- WWTP_focus
+dates   <- dates
+rt_diff_AB <- scatter_mean_diff(fitA_cpd, fitB_cpd, name = "Rt",
+                                dates = dates, plant_names = plants,
+                                rope = 0.05)  # optional ROPE
+it_diff_AB <- scatter_mean_diff(fitA_cpd, fitB_cpd, name = "It",
+                                dates = dates, plant_names = plants,
+                                rope = 25)
+# Show plots
+(rt_diff_AB$plot | it_diff_AB$plot)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(purrr); library(patchwork)
+})
+
+# ============================================================
+# 1) Resúmenes por modelo (Rt / It)
+# ============================================================
+post_summ <- function(fit, name = c("Rt","It"), probs = c(.025,.5,.975),
+                      plant_names = NULL, dates = NULL) {
+  name <- match.arg(name)
+  arr  <- fit$extract_array(name)  # draws × P × T
+  if (is.null(arr)) stop("No encontré draws para ", name)
+  P <- dim(arr)[2]; Tt <- dim(arr)[3]
+
+  m   <- apply(arr, c(2,3), function(x) mean(x, na.rm = TRUE))
+  lo  <- apply(arr, c(2,3), function(x) quantile(x, probs = probs[1], na.rm = TRUE))
+  hi  <- apply(arr, c(2,3), function(x) quantile(x, probs = probs[3], na.rm = TRUE))
+  med <- apply(arr, c(2,3), function(x) quantile(x, probs = 0.5,     na.rm = TRUE))
+
+  df <- tibble::tibble(
+    p = rep(seq_len(P), each = Tt),
+    t = rep(seq_len(Tt), times = P),
+    mean = as.numeric(m),
+    median = as.numeric(med),
+    lo = as.numeric(lo),
+    hi = as.numeric(hi),
+    param = name
+  )
+  if (!is.null(plant_names)) df$plant <- plant_names[df$p]
+  if (!is.null(dates))       df$date  <- dates[df$t]
+  df
+}
+
+# ============================================================
+# 2) Diferencias entre modelos: Δ = M2 - M1 (por (p,t))
+# ============================================================
+post_diff <- function(fit1, fit2, name = c("Rt","It"), probs = c(.025,.5,.975),
+                      rope = 0, plant_names = NULL, dates = NULL) {
+  name <- match.arg(name)
+  a1 <- fit1$extract_array(name)
+  a2 <- fit2$extract_array(name)
+  if (is.null(a1) || is.null(a2)) stop("Faltan draws para ", name)
+
+  # Alinear número de draws (emparejar 1-a-1)
+  n <- min(dim(a1)[1], dim(a2)[1])
+  a1 <- a1[seq_len(n), , , drop = FALSE]
+  a2 <- a2[seq_len(n), , , drop = FALSE]
+  d  <- a2 - a1  # Δ por draw (iter × P × T)
+
+  P <- dim(d)[2]; Tt <- dim(d)[3]
+  m     <- apply(d, c(2,3), function(x) mean(x, na.rm = TRUE))
+  lo    <- apply(d, c(2,3), function(x) quantile(x, probs = probs[1], na.rm = TRUE))
+  hi    <- apply(d, c(2,3), function(x) quantile(x, probs = probs[3], na.rm = TRUE))
+  p_gt0 <- apply(d, c(2,3), function(x) mean(x > 0,           na.rm = TRUE))
+  p_out <- if (rope > 0) apply(d, c(2,3), function(x) mean(abs(x) > rope, na.rm = TRUE)) else NULL
+
+  df <- tibble::tibble(
+    p = rep(seq_len(P), each = Tt),
+    t = rep(seq_len(Tt), times = P),
+    mean = as.numeric(m),
+    lo = as.numeric(lo),
+    hi = as.numeric(hi),
+    p_gt0 = as.numeric(p_gt0),
+    param = name
+  )
+  if (!is.null(p_out)) df$p_out_rope <- as.numeric(p_out)
+  if (!is.null(plant_names)) df$plant <- plant_names[df$p]
+  if (!is.null(dates))       df$date  <- dates[df$t]
+  df
+}
+
+# ============================================================
+# 3) Plot de Δ con PUNTOS
+#    - rojo si se sale del "boundary":
+#      highlight = "rope"  -> |Δ_mean| > rope
+#      highlight = "ci0"   -> IC95% excluye 0 (lo>0 o hi<0)
+#      highlight = "both"  -> cualquiera de las dos
+# ============================================================
+plot_delta_points <- function(df_delta, title = "", rope = 0,
+                              highlight = c("rope","ci0","both"),
+                              times_new_roman = TRUE,
+                              angle_labels = 45, monthly_ticks = TRUE,
+                              y_label_expr = expression(Delta)) {
+  stopifnot(all(c("mean","lo","hi") %in% names(df_delta)))
+  highlight <- match.arg(highlight)
+
+  has_date <- "date" %in% names(df_delta)
+  aes_x <- if (has_date) aes(x = date) else aes(x = t)
+
+  flag_rope <- if (rope > 0) abs(df_delta$mean) > rope else rep(FALSE, nrow(df_delta))
+  flag_ci0  <- (df_delta$lo > 0 | df_delta$hi < 0)
+  out_of_bounds <- switch(highlight,
+                          rope = flag_rope,
+                          ci0  = flag_ci0,
+                          both = flag_rope | flag_ci0)
+
+  df_plot <- df_delta %>% dplyr::mutate(flag = ifelse(out_of_bounds, "out", "in"))
+
+  p <- ggplot(df_plot, aes_x) +
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.5) +
+    { if (rope > 0) geom_hline(yintercept = c(-rope, rope), linetype = 3, linewidth = 0.4) } +
+    geom_point(aes(y = mean, color = flag), size = 1.8, alpha = 0.9) +
+    scale_color_manual(NULL, values = c("in" = "black", "out" = "red")) +
+    labs(x = NULL, y = y_label_expr, title = title) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold"),
+      text = element_text(family = if (times_new_roman) "Times New Roman" else NULL)
+    )
+
+  if (has_date && isTRUE(monthly_ticks)) {
+    p <- p + scale_x_date(date_breaks = "1 month", date_labels = "%b %Y",
+                          expand = c(0.01, 0.01),
+                          guide  = guide_axis(angle = angle_labels))
+  }
+  p
+}
+# ============================================================
+# 4) Helpers para evitar repetición (plots Δ y scatters)
+# ============================================================
+make_delta_plot_for <- function(f1, f2, param, rope, plant_idx, plant_name, dates_vec,
+                                highlight = "rope",
+                                title_fmt = "%s (%s - %s), %s") {
+  nm <- if (param == "Rt") "ΔRt" else "ΔIt"
+  d <- post_diff(f1, f2, name = param, rope = rope,
+                 plant_names = WWTP_focus_full, dates = dates_vec)
+  d %>%
+    dplyr::filter(p == plant_idx) %>%
+    plot_delta_points(
+      title = sprintf(title_fmt, nm, deparse(substitute(f2)), deparse(substitute(f1)), plant_name),
+      rope = rope, highlight = highlight, times_new_roman = TRUE
+    )
+}
+
+make_scatter <- function(dfX, dfY, labX, labY,
+                         param = c("Rt","It"),
+                         facet_ncol = 4,
+                         log = c("none","log10","log1p"),
+                         add_eps = 0,
+                         common_limits = TRUE,
+                         add_title = FALSE,
+                         title_prefix = NULL,
+                         swap_axes = FALSE,
+                         x_code = NULL,   # <<< NUEVO: "A","B","C" para etiqueta X
+                         y_code = NULL) { # <<< NUEVO: "A","B","C" para etiqueta Y
+  log   <- match.arg(log)
+  param <- match.arg(param)
+
+  # ---- JOIN y selección de columnas x/y ----
+  df_join <- dplyr::left_join(dfX, dfY, by = c("p","t")) %>%
+    { if (!swap_axes)
+        dplyr::rename(., x = dplyr::all_of(labX), y = dplyr::all_of(labY))
+      else
+        dplyr::rename(., x = dplyr::all_of(labY), y = dplyr::all_of(labX))
+    }
+
+  # ---- Filtrado y límites ----
+  if (log == "log10") {
+    if (add_eps > 0) df_join <- dplyr::mutate(df_join, x = x + add_eps, y = y + add_eps)
+    df_join <- dplyr::filter(df_join, is.finite(x), is.finite(y), x > 0, y > 0)
+    lims <- if (common_limits) range(c(df_join$x, df_join$y), na.rm = TRUE) else NULL
+  } else if (log == "log1p") {
+    df_join <- dplyr::filter(df_join, is.finite(x), is.finite(y), x >= 0, y >= 0)
+    lims <- if (common_limits) range(c(df_join$x, df_join$y), na.rm = TRUE) else NULL
+  } else {
+    df_join <- dplyr::filter(df_join, is.finite(x), is.finite(y))
+    lims <- if (common_limits) range(c(df_join$x, df_join$y), na.rm = TRUE) else NULL
+  }
+
+  # ---- Etiquetas elegantes ----
+  param_lab <- if (param == "Rt") quote(R[t]) else quote(I[t])
+  axis_expr <- function(code) {
+    if (code == "A")      bquote("Observed, " ~ hat(sigma))
+    else if (code == "B") bquote("Observed, " ~ hat(P)[t])
+    else if (code == "C") bquote("Filter estimates, " ~ hat(P)[t])
+    else                  bquote(.(param_lab))
+  }
+
+  # Inferir códigos de A/B/C a partir de los nombres "meanA/B/C" si no se pasan
+  code_from_lab <- function(lab) sub("^mean", "", lab)  # "A","B","C"
+  code_orig_X <- code_from_lab(labX)
+  code_orig_Y <- code_from_lab(labY)
+
+  # Elegir códigos finales (permitiendo override manual)
+  if (is.null(x_code) && is.null(y_code)) {
+    codeX <- if (!swap_axes) code_orig_X else code_orig_Y
+    codeY <- if (!swap_axes) code_orig_Y else code_orig_X
+  } else {
+    # Si el usuario pasa x_code / y_code, respétalos tal cual
+    codeX <- if (is.null(x_code)) (if (!swap_axes) code_orig_X else code_orig_Y) else x_code
+    codeY <- if (is.null(y_code)) (if (!swap_axes) code_orig_Y else code_orig_X) else y_code
+  }
+
+  x_expr <- axis_expr(codeX)
+  y_expr <- axis_expr(codeY)
+
+  p <- ggplot2::ggplot(df_join, ggplot2::aes(x = x, y = y)) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    ggplot2::geom_point(alpha = .5, size = 1) +
+    ggplot2::facet_wrap(
+      ~ p, ncol = facet_ncol,
+      labeller = ggplot2::labeller(p = setNames(WWTP_focus_full, 1:length(WWTP_focus_full)))
+    ) +
+    ggplot2::labs(x = x_expr, y = y_expr,
+                  title = if (isTRUE(add_title) && !is.null(title_prefix)) title_prefix else NULL) +
+    ggplot2::theme_classic() +
+    ggplot2::theme(text = ggplot2::element_text(family = "Times New Roman")) +
+    ggplot2::coord_equal()
+
+  if (log == "log10") {
+    p <- p + ggplot2::scale_x_log10(limits = lims, expand = c(0.01, 0.01)) +
+             ggplot2::scale_y_log10(limits = lims, expand = c(0.01, 0.01))
+  } else if (log == "log1p") {
+    p <- p + ggplot2::scale_x_continuous(trans = "log1p", limits = lims, expand = c(0.01, 0.01)) +
+             ggplot2::scale_y_continuous(trans = "log1p", limits = lims, expand = c(0.01, 0.01))
+  } else if (!is.null(lims)) {
+    p <- p + ggplot2::xlim(lims) + ggplot2::ylim(lims)
+  }
+  p
+}
+
+# ============================================================
+# 5) Parámetros y comparaciones a generar
+# ============================================================
+rope_rt <- 0.05
+rope_it <- 25
+pl_idx  <- 1
+WWTP_focus_full <- WWTP_focus  # asume mismo orden en los tres fits
+pl_name <- WWTP_focus[pl_idx]  # define afuera WWTP_focus_full y dates
+
+# --- Δ con puntos (rojo si |Δ| > ROPE por defecto) ---
+#p1  <- make_delta_plot_for(fitA, fitB, "Rt", rope_rt, pl_idx, pl_name, dates, highlight = "rope")  # C - A
+#p2  <- make_delta_plot_for(fitA, fitB, "It", rope_it, pl_idx, pl_name, dates, highlight = "rope")
+
+# ============================================================
+# 6) Scatters de medias (Rt / It) entre modelos
+# ============================================================
+# Resúmenes de medias para A, B, C
+RtA <- post_summ(fitA_cpd,"Rt", plant_names = WWTP_focus, dates = dates_rsv) %>% dplyr::transmute(p,t,meanA=mean)
+RtB <- post_summ(fitB_cpd,"Rt", plant_names = WWTP_focus, dates = dates_rsv) %>% dplyr::transmute(p,t,meanB=mean)
+
+ItA <- post_summ(fitA_cpd,"It", plant_names = WWTP_focus, dates = dates_rsv) %>% dplyr::transmute(p,t,meanA=mean)
+ItB <- post_summ(fitB_cpd,"It", plant_names = WWTP_focus, dates = dates_rsv) %>% dplyr::transmute(p,t,meanB=mean)
+
+# Rt
+sc_Rt_AB <- make_scatter(RtA, RtB, "meanA", "meanB", log = "log10")
+
+# It
+sc_It_AB <- make_scatter(ItA, ItB, "meanA", "meanB", log = "log10")
+
+
+# Títulos y paneles (solo AB, AC, BC)
+sc_Rt_AB <- sc_Rt_AB + labs(title = expression(R[t] ~ ": A vs B"))
+
+sc_It_AB <- sc_It_AB + labs(title = expression(I[t] ~ ": A vs B"))
+
+
+p_rt_AB <- make_scatter(RtB, RtA, "meanB", "meanA",
+                        param="Rt", facet_ncol=1,
+                        add_title=TRUE, title_prefix=expression(R[t]*": A vs B"),
+                        x_code="C", y_code="A")
+p_it_AB <- make_scatter(ItB, ItA, "meanB", "meanA",
+                        param="It", facet_ncol=1,
+                        add_title=TRUE, title_prefix=expression(I[t]*": A vs B"),
+                        x_code="C", y_code="A")
+(p_rt_AB|p_it_AB)
+```
+
+```{r}
+# ============================================================
+# Delays entre picos: (It vs Load) y (Rt vs Load)
+# ============================================================
+compute_peak_delays <- function(fit, y, dates, plants, windows,
+                                y_is_T_by_P = TRUE) {
+  suppressPackageStartupMessages({library(dplyr); library(tidyr); library(purrr)})
+
+  as_PT <- function(m, tp = TRUE){ m <- as.matrix(m); if (tp) t(m) else m }
+
+  # --- extrae medias poste (draws × P × T -> P × T) ---
+  It_arr <- fit$extract_array("It")
+  Rt_arr <- fit$extract_array("Rt")
+  stopifnot(!is.null(It_arr), !is.null(Rt_arr))
+  It_mean_PT <- apply(It_arr, c(2,3), mean, na.rm = TRUE)
+  Rt_mean_PT <- apply(Rt_arr, c(2,3), mean, na.rm = TRUE)
+
+  # --- carga viral (natural scale) como P × T ---
+  y_PT <- as_PT(y, tp = y_is_T_by_P)   # <- FIX: usar 'tp' en vez de 'y_is_T_by_P'
+
+  # --- a long por planta-fecha ---
+  to_long <- function(M, nm) {
+    tibble::as_tibble(t(M), .name_repair = "minimal") |>
+      `names<-`(plants) |>
+      mutate(Date = dates) |>
+      tidyr::pivot_longer(-Date, names_to = "WWTP", values_to = nm)
+  }
+  df_It  <- to_long(It_mean_PT, "It_mean")
+  df_Rt  <- to_long(Rt_mean_PT, "Rt_mean")
+  df_L   <- to_long(y_PT, "Load")
+
+  # --- util: fecha del máximo (primer máximo si hay empates) ---
+  peak_date <- function(x, d) {
+    if (all(!is.finite(x))) return(as.Date(NA))
+    i <- which.max(replace(x, !is.finite(x), -Inf))
+    d[i]
+  }
+
+  # --- calcular por ventana y planta ---
+  win_tbl <- tibble::tibble(
+    window_id = names(windows),
+    start = as.Date(sapply(windows, `[`, 1)),
+    end   = as.Date(sapply(windows, `[`, 2))
+  )
+
+  res <- win_tbl |>
+    tidyr::uncount(length(plants)) |>
+    mutate(WWTP = rep(plants, each = nrow(win_tbl))) |>
+    rowwise() |>
+    mutate(
+      It_sub   = list(df_It  |> filter(WWTP == WWTP, Date >= start, Date <= end)),
+      Rt_sub   = list(df_Rt  |> filter(WWTP == WWTP, Date >= start, Date <= end)),
+      Load_sub = list(df_L   |> filter(WWTP == WWTP, Date >= start, Date <= end)),
+
+      date_peak_It   = peak_date(It_sub$It_mean,   It_sub$Date),
+      date_peak_Rt   = peak_date(Rt_sub$Rt_mean,   Rt_sub$Date),
+      date_peak_Load = peak_date(Load_sub$Load,    Load_sub$Date),
+
+      delay_It_vs_Load_weeks = as.numeric(date_peak_It - date_peak_Load, units = "days") / 7,
+      delay_Rt_vs_Load_weeks = as.numeric(date_peak_Rt - date_peak_Load, units = "days") / 7
+    ) |>
+    ungroup() |>
+    transmute(
+      WWTP, window = window_id,
+      date_peak_Rt, date_peak_It, date_peak_Load,
+      delay_Rt_vs_Load_weeks = round(delay_Rt_vs_Load_weeks, 2),
+      delay_It_vs_Load_weeks = round(delay_It_vs_Load_weeks,  2)
+    )
+
+  res
+}
+
+wins <- list(
+  "Oct2023–Feb2024" = c(as.Date("2023-10-01"), as.Date("2024-02-29"))
+)
+
+delays_A <- compute_peak_delays(fitA, mat_rsv_cpd_b,  dates_rsv, WWTP_focus, wins, y_is_T_by_P = TRUE)
+delays_B <- compute_peak_delays(fitB, y_kf_cpd_TxP_b, dates_rsv, WWTP_focus, wins, y_is_T_by_P = TRUE)
+delays_C <- compute_peak_delays(fitC, y_kf_cpd_TxP_b, dates_rsv, WWTP_focus, wins, y_is_T_by_P = TRUE)
+# Add a column to identify the model
+delays_A <- delays_A %>% mutate(model = "A")
+delays_B <- delays_B %>% mutate(model = "B")
+delays_C <- delays_C %>% mutate(model = "C")
+delays_A
+delays_B
+delays_C
+```
